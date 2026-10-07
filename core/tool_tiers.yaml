@@ -178,3 +178,27 @@ appscript:
     - get_script_activity
     - manage_script_trigger
   complete: []
+
+meet:
+  core:
+    - manage_meet_space
+    - list_meet_conference_records
+  extended:
+    - manage_meet_member
+    - get_meet_conference_artifacts
+  complete: []
+
+keep:
+  core:
+    - list_keep_notes
+    - get_keep_note
+  extended:
+    - manage_keep_note
+  complete:
+    - manage_keep_note_permissions
+
+api:
+  core:
+    - google_api_request
+  extended: []
+  complete: []

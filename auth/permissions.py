@@ -17,6 +17,11 @@ import logging
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from auth.scopes import (
+    MEET_SPACE_CREATED_SCOPE,
+    MEET_SPACE_READONLY_SCOPE,
+    MEET_SPACE_SETTINGS_SCOPE,
+    KEEP_SCOPE,
+    KEEP_READONLY_SCOPE,
     GMAIL_READONLY_SCOPE,
     GMAIL_LABELS_SCOPE,
     GMAIL_MODIFY_SCOPE,
@@ -143,6 +148,18 @@ SERVICE_PERMISSION_LEVELS: Dict[str, List[Tuple[str, List[str]]]] = {
                 DRIVE_SCOPE,
             ],
         ),
+    ],
+    "meet": [
+        ("readonly", [MEET_SPACE_READONLY_SCOPE]),
+        ("full", [MEET_SPACE_CREATED_SCOPE, MEET_SPACE_SETTINGS_SCOPE]),
+    ],
+    "keep": [
+        ("readonly", [KEEP_READONLY_SCOPE]),
+        ("full", [KEEP_SCOPE]),
+    ],
+    "api": [
+        ("readonly", []),
+        ("full", []),
     ],
 }
 

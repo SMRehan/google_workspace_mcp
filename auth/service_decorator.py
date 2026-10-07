@@ -39,6 +39,11 @@ from auth.oauth_config import (
 from core.context import set_fastmcp_session_id
 from core.telemetry import record_authenticated_user
 from auth.scopes import (
+    MEET_SPACE_CREATED_SCOPE,
+    MEET_SPACE_READONLY_SCOPE,
+    MEET_SPACE_SETTINGS_SCOPE,
+    KEEP_SCOPE,
+    KEEP_READONLY_SCOPE,
     GMAIL_READONLY_SCOPE,
     GMAIL_SEND_SCOPE,
     GMAIL_COMPOSE_SCOPE,
@@ -612,6 +617,8 @@ SERVICE_CONFIGS = {
     "people": {"service": "people", "version": "v1"},
     "customsearch": {"service": "customsearch", "version": "v1"},
     "script": {"service": "script", "version": "v1"},
+    "meet": {"service": "meet", "version": "v2"},
+    "keep": {"service": "keep", "version": "v1"},
 }
 
 
@@ -667,6 +674,13 @@ SCOPE_GROUPS = {
     "script_deployments_readonly": SCRIPT_DEPLOYMENTS_READONLY_SCOPE,
     "script_run": SCRIPT_EXTERNAL_REQUEST_SCOPE,
     "script_scriptapp": SCRIPT_SCRIPTAPP_SCOPE,
+    # Meet scopes
+    "meet_created": MEET_SPACE_CREATED_SCOPE,
+    "meet_read": MEET_SPACE_READONLY_SCOPE,
+    "meet_settings": MEET_SPACE_SETTINGS_SCOPE,
+    # Keep scopes
+    "keep": KEEP_SCOPE,
+    "keep_read": KEEP_READONLY_SCOPE,
 }
 
 

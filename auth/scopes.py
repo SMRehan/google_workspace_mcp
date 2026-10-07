@@ -88,6 +88,15 @@ SCRIPT_EXTERNAL_REQUEST_SCOPE = (
 )
 SCRIPT_SCRIPTAPP_SCOPE = "https://www.googleapis.com/auth/script.scriptapp"
 
+# Google Meet API scopes
+MEET_SPACE_CREATED_SCOPE = "https://www.googleapis.com/auth/meetings.space.created"
+MEET_SPACE_READONLY_SCOPE = "https://www.googleapis.com/auth/meetings.space.readonly"
+MEET_SPACE_SETTINGS_SCOPE = "https://www.googleapis.com/auth/meetings.space.settings"
+
+# Google Keep API scopes (Workspace accounts only)
+KEEP_SCOPE = "https://www.googleapis.com/auth/keep"
+KEEP_READONLY_SCOPE = "https://www.googleapis.com/auth/keep.readonly"
+
 # Google scope hierarchy: broader scopes that implicitly cover narrower ones.
 # See https://developers.google.com/gmail/api/auth/scopes,
 # https://developers.google.com/drive/api/guides/api-specific-auth, etc.
@@ -204,6 +213,14 @@ SCRIPT_SCOPES = [
     DRIVE_SCOPE,  # Required for manage_script_project delete (uses Drive API)
 ]
 
+MEET_SCOPES = [
+    MEET_SPACE_CREATED_SCOPE,
+    MEET_SPACE_READONLY_SCOPE,
+    MEET_SPACE_SETTINGS_SCOPE,
+]
+
+KEEP_SCOPES = [KEEP_SCOPE, KEEP_READONLY_SCOPE]
+
 # Tool-to-scopes mapping
 TOOL_SCOPES_MAP = {
     "gmail": GMAIL_SCOPES,
@@ -218,6 +235,11 @@ TOOL_SCOPES_MAP = {
     "contacts": CONTACTS_SCOPES,
     "search": CUSTOM_SEARCH_SCOPES,
     "appscript": SCRIPT_SCOPES,
+    "meet": MEET_SCOPES,
+    "keep": KEEP_SCOPES,
+    # Generic REST passthrough: adds no scopes of its own, uses whatever the
+    # enabled services already requested.
+    "api": [],
 }
 
 # Tool-to-read-only-scopes mapping
@@ -245,6 +267,9 @@ TOOL_READONLY_SCOPES_MAP = {
         SCRIPT_METRICS_SCOPE,
         DRIVE_READONLY_SCOPE,
     ],
+    "meet": [MEET_SPACE_READONLY_SCOPE],
+    "keep": [KEEP_READONLY_SCOPE],
+    "api": [],
 }
 
 
