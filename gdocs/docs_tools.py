@@ -55,6 +55,7 @@ from gdocs.docs_helpers import (
     create_update_paragraph_style_request,
     extract_text_from_elements,
     process_tab_hierarchy,
+    build_batch_update_body,
 )
 
 # Import document structure and table utilities
@@ -631,6 +632,7 @@ async def modify_doc_text(
     clear_link: bool = None,
     baseline_offset: str = None,
     small_caps: bool = None,
+    write_mode: Literal["EDIT", "SUGGEST"] = "EDIT",
 ) -> str:
     """
     Modifies text in a Google Doc - can insert/replace text and/or apply formatting in a single operation.
@@ -667,6 +669,9 @@ async def modify_doc_text(
         clear_link: Remove hyperlink from the target range
         baseline_offset: One of NONE, SUPERSCRIPT, SUBSCRIPT
         small_caps: Whether to apply small caps
+        write_mode: "EDIT" (default) applies the change directly; "SUGGEST"
+            records it as a tracked suggestion that collaborators accept or
+            reject (sent as writeControl.writeMode).
 
     Returns:
         str: Confirmation message with operation details
@@ -868,7 +873,10 @@ async def modify_doc_text(
     try:
         await asyncio.to_thread(
             service.documents()
-            .batchUpdate(documentId=document_id, body={"requests": requests})
+            .batchUpdate(
+                documentId=document_id,
+                body=build_batch_update_body(requests, write_mode),
+            )
             .execute
         )
     except HttpError as error:
@@ -899,6 +907,7 @@ async def find_and_replace_doc(
     replace_text: str,
     match_case: bool = False,
     tab_id: Optional[str] = None,
+    write_mode: Literal["EDIT", "SUGGEST"] = "EDIT",
 ) -> str:
     """
     Finds and replaces text throughout a Google Doc. No index calculation required.
@@ -919,6 +928,9 @@ async def find_and_replace_doc(
         replace_text: Text to replace with
         match_case: Whether to match case exactly
         tab_id: Optional ID of the tab to target
+        write_mode: "EDIT" (default) applies the change directly; "SUGGEST"
+            records it as a tracked suggestion that collaborators accept or
+            reject (sent as writeControl.writeMode).
 
     Returns:
         str: Confirmation message with replacement count
@@ -934,7 +946,9 @@ async def find_and_replace_doc(
 
     result = await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(
+            documentId=document_id, body=build_batch_update_body(requests, write_mode)
+        )
         .execute
     )
 
@@ -970,6 +984,7 @@ async def insert_doc_elements(
     columns: int = None,
     list_type: str = None,
     text: str = None,
+    write_mode: Literal["EDIT", "SUGGEST"] = "EDIT",
 ) -> str:
     """
     Inserts structural elements like tables, lists, or page breaks into a Google Doc.
@@ -983,6 +998,9 @@ async def insert_doc_elements(
         columns: Number of columns for table (required for table)
         list_type: Type of list ("UNORDERED", "ORDERED") (required for list)
         text: Initial text content for list items
+        write_mode: "EDIT" (default) applies the change directly; "SUGGEST"
+            records it as a tracked suggestion that collaborators accept or
+            reject (sent as writeControl.writeMode).
 
     Returns:
         str: Confirmation message with insertion details
@@ -1031,7 +1049,9 @@ async def insert_doc_elements(
 
     await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(
+            documentId=document_id, body=build_batch_update_body(requests, write_mode)
+        )
         .execute
     )
 
@@ -1233,6 +1253,7 @@ async def batch_update_doc(
     user_google_email: str,
     document_id: str,
     operations: BatchDocOperations,
+    write_mode: Literal["EDIT", "SUGGEST"] = "EDIT",
 ) -> str:
     """
     Executes multiple low-level document operations in a single atomic batch update.
@@ -1310,6 +1331,10 @@ async def batch_update_doc(
         document_id: ID of the document to update
         operations: List of operation dicts. Each operation MUST have a 'type' field.
                     All operations accept an optional 'tab_id' to target a specific tab.
+        write_mode: "EDIT" (default) applies every operation directly. "SUGGEST"
+                    records the whole batch as tracked suggestions (Docs
+                    writeControl.writeMode) that collaborators can accept or
+                    reject with manage_doc_suggestions.
 
     Supported operation types and their parameters:
 
@@ -1430,6 +1455,50 @@ async def batch_update_doc(
                          optional: parent_tab_id (str)
       delete_doc_tab   - required: tab_id (str)
       update_doc_tab   - required: tab_id (str), title (str)
+      insert_person    - required: email (str)
+                         optional: name, index, end_of_segment, after_heading,
+                                   before_heading, anchor_text, tab_id, segment_id
+                         Inserts a person smart chip. Like insert_text, takes
+                         exactly one location (index, end_of_segment or anchor).
+      insert_date      - required: date (ISO 8601, e.g. "2026-10-08")
+                         optional: date_format (DATE_FORMAT_MONTH_DAY_ABBREVIATED|
+                                   DATE_FORMAT_MONTH_DAY_FULL|
+                                   DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED|
+                                   DATE_FORMAT_ISO8601), time_format, time_zone_id,
+                                   locale, plus one location as for insert_person
+      insert_rich_link - required: uri (Drive/YouTube/Calendar URL)
+                         optional: title, plus one location as for insert_person
+      create_footnote  - optional: text (written into the new footnote), plus one
+                                   body location (index, end_of_segment or anchor;
+                                   no segment_id). The reply reports the new
+                                   footnote_id, which is its segment_id.
+      create_dropdown_definition
+                       - required: options (2-50 strings or
+                                   {display_value, option_id} objects)
+                         optional: dropdown_definition_id (^kix.XXXX, so a later
+                                   insert_dropdown can use it), title, tab_id
+                         The reply reports the definition and option IDs.
+      insert_dropdown  - required: dropdown_definition_id (str)
+                         optional: selected_option_id, plus one location as for
+                                   insert_person
+      replace_image    - required: image_object_id (str), uri (str)
+                         optional: image_replace_method ('CENTER_CROP'), tab_id
+      delete_header    - required: header_id (str)      optional: tab_id
+      delete_footer    - required: footer_id (str)      optional: tab_id
+      update_named_style
+                       - required: named_style_type (NORMAL_TEXT|TITLE|SUBTITLE|
+                                   HEADING_1..HEADING_6) plus at least one of the
+                                   format_text style fields (bold, italic, underline,
+                                   strikethrough, font_size, font_family, font_weight,
+                                   text_color, background_color, baseline_offset,
+                                   small_caps) or update_paragraph_style fields
+                                   (alignment, line_spacing, indent_*, space_above,
+                                   space_below, direction, keep_*, spacing_mode,
+                                   shading_color, border_*)
+                         Redefines the named style document-wide: every paragraph
+                         using it changes, now and in future.
+      delete_positioned_object
+                       - required: object_id (str)      optional: tab_id
 
     Example - Safe document building (no index calculation needed):
         [
@@ -1462,6 +1531,21 @@ async def batch_update_doc(
             {"type": "update_document_style", "margin_top": 72, "margin_bottom": 72}
         ]
 
+    Example - Smart chips, footnotes and dropdowns (no index math):
+        [
+            {"type": "insert_person", "end_of_segment": true, "email": "ana@example.com"},
+            {"type": "insert_date", "anchor_text": "Due:", "date": "2026-11-01"},
+            {"type": "create_footnote", "anchor_text": "see note", "text": "Source: Q3 report."},
+            {"type": "create_dropdown_definition", "dropdown_definition_id": "kix.status",
+             "options": ["Draft", "Review", "Final"]},
+            {"type": "insert_dropdown", "end_of_segment": true,
+             "dropdown_definition_id": "kix.status"}
+        ]
+
+    Example - Propose edits as suggestions instead of applying them:
+        write_mode="SUGGEST" with
+        [{"type": "find_replace", "find_text": "Q3", "replace_text": "Q4"}]
+
     Returns:
         str: Confirmation message with batch results and document length for chaining
     """
@@ -1491,7 +1575,7 @@ async def batch_update_doc(
     batch_manager = BatchOperationManager(service)
 
     success, message, metadata = await batch_manager.execute_batch_operations(
-        document_id, normalized_operations
+        document_id, normalized_operations, write_mode=write_mode
     )
 
     if success:
@@ -1511,6 +1595,11 @@ async def batch_update_doc(
             parts.append(
                 f" Revision: {revision_before or 'unknown'} -> "
                 f"{revision_after or 'unknown'}."
+            )
+        if metadata.get("write_mode") == "SUGGEST":
+            parts.append(
+                " Changes were recorded as suggestions; use manage_doc_suggestions "
+                "to list, accept or reject them."
             )
 
         # Reporting what the edited range now looks like lets the caller confirm
@@ -2390,6 +2479,7 @@ async def update_paragraph_style(
     list_type: str = None,
     list_nesting_level: int = None,
     bullet_preset: str = None,
+    write_mode: Literal["EDIT", "SUGGEST"] = "EDIT",
 ) -> str:
     """
     Apply paragraph-level formatting, heading styles, and/or list formatting to a range in a Google Doc.
@@ -2436,6 +2526,9 @@ async def update_paragraph_style(
         list_nesting_level: Nesting level for lists (0-8, where 0 is top level, default is 0)
                            Use higher levels for nested/indented list items
         bullet_preset: Optional explicit Google Docs bullet preset
+        write_mode: "EDIT" (default) applies the change directly; "SUGGEST"
+            records it as a tracked suggestion that collaborators accept or
+            reject (sent as writeControl.writeMode).
 
     Returns:
         str: Confirmation message with formatting details
@@ -2621,7 +2714,9 @@ async def update_paragraph_style(
 
     await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(
+            documentId=document_id, body=build_batch_update_body(requests, write_mode)
+        )
         .execute
     )
 
