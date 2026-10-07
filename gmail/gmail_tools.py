@@ -64,6 +64,10 @@ from auth.scopes import (
     GMAIL_LABELS_SCOPE,
     has_required_scopes,
 )
+
+# Registers the management tools on the shared server when main.py imports
+# gmail.gmail_tools; the module has no dependency back on this file.
+import gmail.gmail_management_tools  # noqa: F401
 from gmail.gmail_helpers import (
     FILTER_APPLY_DEFAULT_MAX_MESSAGES,
     GMAIL_METADATA_HEADERS,
