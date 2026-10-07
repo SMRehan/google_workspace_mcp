@@ -57,6 +57,27 @@ from gdocs.docs_helpers import (
     process_tab_hierarchy,
     build_batch_update_body,
 )
+from gdocs.docs_comments import (
+    COMMENT_ACTIONS,
+    CommentInputError,
+    create_add_comment_reply_request,
+    create_delete_comment_reply_request,
+    create_delete_comment_request,
+    create_insert_comment_request,
+    create_update_comment_post_request,
+    describe_comment_thread,
+    describe_post,
+    format_comment_list,
+    list_drive_comments,
+    resolve_comment_range,
+)
+from gdocs.docs_suggestions import (
+    SUGGESTION_ACTIONS,
+    collect_suggestions,
+    create_suggestion_action_request,
+    format_suggestions,
+    normalize_suggestion_ids,
+)
 
 # Import document structure and table utilities
 from gdocs.docs_structure import (
@@ -3202,6 +3223,270 @@ async def manage_doc_tab(
         "tab_id": tab_id,
         "link": link,
     }
+
+
+@server.tool(
+    title="Manage Doc Comments",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("manage_doc_comments", service_type="docs")
+@require_multiple_services(
+    [
+        {"service_type": "docs", "scopes": "docs_write", "param_name": "docs_service"},
+        {
+            "service_type": "drive",
+            "scopes": "drive_read",
+            "param_name": "drive_service",
+        },
+    ]
+)
+async def manage_doc_comments(
+    docs_service: Any,
+    drive_service: Any,
+    user_google_email: str,
+    document_id: str,
+    action: Literal[
+        "list",
+        "create",
+        "reply",
+        "resolve",
+        "reopen",
+        "update",
+        "delete",
+        "delete_reply",
+    ],
+    content: Optional[str] = None,
+    comment_id: Optional[str] = None,
+    post_id: Optional[str] = None,
+    start_index: Optional[int] = None,
+    end_index: Optional[int] = None,
+    anchor_text: Optional[str] = None,
+    assignee_email: Optional[str] = None,
+    resolve: bool = False,
+    tab_id: Optional[str] = None,
+    segment_id: Optional[str] = None,
+    include_resolved: bool = True,
+) -> str:
+    """
+    Create, reply to, resolve, edit, delete and list comment threads anchored to document text.
+
+    Unlike manage_document_comment (Drive API, file-level comments), this uses the
+    Docs API so a new comment is anchored to an exact range, by index or by the
+    literal text it should highlight, and threads can be resolved, reopened,
+    edited and deleted.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the document
+        action: One of:
+            - "list": every thread with comment_id, post_ids, status, assignee,
+              anchor and replies (read through the Drive comments API)
+            - "create": new thread on a range; needs content and either
+              start_index+end_index or anchor_text
+            - "reply": add a reply (comment_id, content; optional assignee_email;
+              resolve=true also resolves the thread)
+            - "resolve" / "reopen": change thread status (comment_id; optional content)
+            - "update": edit the head post or a reply (comment_id, post_id, content)
+            - "delete": remove the whole thread (comment_id)
+            - "delete_reply": remove one reply (comment_id, post_id)
+        content: Comment text (plain text, max 2048 bytes)
+        comment_id: Thread ID from create/list output
+        post_id: Post ID of the head post or a reply (from create/list output)
+        start_index: Start of the commented range (Docs index, inclusive)
+        end_index: End of the commented range (exclusive)
+        anchor_text: Literal text to comment on instead of indices; it must occur
+            exactly once within one paragraph of the targeted tab/segment
+        assignee_email: Assign the thread to this person (create or reply)
+        resolve: With action="reply", also resolve the thread
+        tab_id: Optional tab containing the range (create)
+        segment_id: Optional header/footer/footnote segment containing the range (create)
+        include_resolved: With action="list", include resolved threads (default true)
+
+    Returns:
+        str: Human-readable result including the IDs needed for follow-up actions
+    """
+    logger.info(
+        f"[manage_doc_comments] action={action}, doc={document_id}, comment_id={comment_id}"
+    )
+    if action not in COMMENT_ACTIONS:
+        raise UserInputError(
+            f"Invalid action '{action}'. Must be one of: {', '.join(COMMENT_ACTIONS)}."
+        )
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+
+    if action == "list":
+        comments = await list_drive_comments(drive_service, document_id)
+        return format_comment_list(comments, document_id, include_resolved)
+
+    try:
+        if action == "create":
+            has_indices = start_index is not None or end_index is not None
+            if has_indices and anchor_text is not None:
+                raise CommentInputError(
+                    "Provide either start_index and end_index or anchor_text, not both."
+                )
+            if anchor_text is not None:
+                doc = await asyncio.to_thread(
+                    docs_service.documents()
+                    .get(documentId=document_id, includeTabsContent=True)
+                    .execute
+                )
+                start_index, end_index = resolve_comment_range(
+                    doc, anchor_text, tab_id, segment_id
+                )
+            elif start_index is None or end_index is None:
+                raise CommentInputError(
+                    "The 'create' action needs start_index and end_index, or anchor_text."
+                )
+            request = create_insert_comment_request(
+                start_index,
+                end_index,
+                content,
+                assignee_email=assignee_email,
+                tab_id=tab_id,
+                segment_id=segment_id,
+            )
+        elif action == "reply":
+            request = create_add_comment_reply_request(
+                comment_id,
+                content=content,
+                assignee_email=assignee_email,
+                comment_action="RESOLVE" if resolve else None,
+            )
+        elif action in ("resolve", "reopen"):
+            request = create_add_comment_reply_request(
+                comment_id,
+                content=content,
+                assignee_email=assignee_email,
+                comment_action=action.upper(),
+            )
+        elif action == "update":
+            request = create_update_comment_post_request(comment_id, post_id, content)
+        elif action == "delete":
+            request = create_delete_comment_request(comment_id)
+        else:  # delete_reply
+            request = create_delete_comment_reply_request(comment_id, post_id)
+    except CommentInputError as e:
+        raise UserInputError(str(e)) from e
+
+    result = await asyncio.to_thread(
+        docs_service.documents()
+        .batchUpdate(documentId=document_id, body={"requests": [request]})
+        .execute
+    )
+    reply = (result.get("replies") or [{}])[0]
+
+    if action == "create":
+        thread = reply.get("insertComment", {}).get("commentThread", {})
+        return (
+            f"Created comment on range {start_index}-{end_index} in document "
+            f"{document_id}: {describe_comment_thread(thread)}. Link: {link}"
+        )
+    if action in ("reply", "resolve", "reopen"):
+        post = reply.get("addCommentReply", {}).get("post", {})
+        verb = {
+            "reply": "Replied to",
+            "resolve": "Resolved",
+            "reopen": "Reopened",
+        }[action]
+        note = " and resolved it" if action == "reply" and resolve else ""
+        return (
+            f"{verb} comment thread {comment_id}{note} in document {document_id} "
+            f"({describe_post(post)}). Link: {link}"
+        )
+    if action == "update":
+        return f"Updated post {post_id} in comment thread {comment_id} of document {document_id}. Link: {link}"
+    if action == "delete":
+        return f"Deleted comment thread {comment_id} from document {document_id}. Link: {link}"
+    return f"Deleted reply {post_id} from comment thread {comment_id} in document {document_id}. Link: {link}"
+
+
+@server.tool(
+    title="Manage Doc Suggestions",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("manage_doc_suggestions", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def manage_doc_suggestions(
+    service: Any,
+    user_google_email: str,
+    document_id: str,
+    action: Literal["list", "accept", "reject", "delete"],
+    suggestion_ids: Optional[List[str]] = None,
+    tab_id: Optional[str] = None,
+) -> str:
+    """
+    List, accept, reject or delete tracked suggestions ("Suggesting" mode edits) in a Google Doc.
+
+    Suggestions are created by collaborators in Suggesting mode or by any write
+    tool here called with write_mode="SUGGEST". "list" walks the document with
+    suggestionsViewMode=SUGGESTIONS_INLINE and reports each suggestion ID with
+    its kind (insertion, deletion, text_style, paragraph_style, ...) and a text
+    snippet; the other actions apply to one or many suggestion_ids in a single
+    batch.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the document
+        action: "list", "accept", "reject" or "delete"
+        suggestion_ids: Suggestion IDs to act on (required for accept, reject, delete)
+        tab_id: With action="list", only report suggestions in this tab
+
+    Returns:
+        str: Suggestion listing, or confirmation of the IDs acted on
+    """
+    logger.info(
+        f"[manage_doc_suggestions] action={action}, doc={document_id}, ids={suggestion_ids}"
+    )
+    if action not in SUGGESTION_ACTIONS:
+        raise UserInputError(
+            f"Invalid action '{action}'. Must be one of: {', '.join(SUGGESTION_ACTIONS)}."
+        )
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+
+    if action == "list":
+        doc = await asyncio.to_thread(
+            service.documents()
+            .get(
+                documentId=document_id,
+                includeTabsContent=True,
+                suggestionsViewMode="SUGGESTIONS_INLINE",
+            )
+            .execute
+        )
+        return format_suggestions(collect_suggestions(doc), document_id, tab_id)
+
+    try:
+        ids = normalize_suggestion_ids(suggestion_ids)
+    except ValueError as e:
+        raise UserInputError(str(e)) from e
+    if not ids:
+        raise UserInputError(
+            f"'suggestion_ids' is required for the '{action}' action; "
+            "use action='list' to find them."
+        )
+
+    requests = [create_suggestion_action_request(action, sid) for sid in ids]
+    await asyncio.to_thread(
+        service.documents()
+        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .execute
+    )
+    verb = {"accept": "Accepted", "reject": "Rejected", "delete": "Deleted"}[action]
+    return (
+        f"{verb} {len(ids)} suggestion(s) in document {document_id}: "
+        f"{', '.join(ids)}. Link: {link}"
+    )
 
 
 # Create comment management tools for documents
