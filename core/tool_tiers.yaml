@@ -97,6 +97,13 @@ sheets:
     - manage_spreadsheet_comment
     - manage_conditional_formatting
     - manage_named_range
+    - batch_update_sheet
+    - manage_sheet_filter
+    - manage_sheet_protection
+    - manage_sheet_validation
+    - manage_sheet_chart
+    - sort_sheet_range
+    - find_replace_sheet
 
 chat:
   core:
