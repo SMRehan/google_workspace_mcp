@@ -18,6 +18,13 @@ gmail:
   complete:
     - get_gmail_threads_content_batch
     - batch_modify_gmail_message_labels
+    - manage_gmail_message
+    - manage_gmail_draft
+    - manage_gmail_thread
+    - get_gmail_profile
+    - manage_gmail_settings
+    - manage_gmail_sharing_settings
+    - list_gmail_history
     - start_google_auth
 
 drive:
