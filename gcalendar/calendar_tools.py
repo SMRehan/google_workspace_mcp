@@ -17,13 +17,32 @@ import pytz
 from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
 
+from auth.permissions import is_action_denied
 from auth.service_decorator import require_google_service
 from core.utils import handle_http_errors, StringList, StringOrDictList, UserInputError
 from gcalendar.calendar_helpers import (
     _format_event_detail_lines,
     _format_event_time,
     _get_meeting_link,
+    clear_calendar,
+    delete_acl_rule,
+    delete_calendar,
+    format_calendar_list_line,
+    get_acl_rule,
+    get_calendar,
+    get_settings_and_colors,
+    import_event,
+    insert_acl_rule,
+    list_acl_rules,
+    list_event_instances,
+    move_event,
     parse_event_boundary,
+    quick_add_event,
+    subscribe_calendar,
+    unsubscribe_calendar,
+    update_acl_rule,
+    update_calendar,
+    update_calendar_list_entry,
 )
 
 from mcp.types import ToolAnnotations
@@ -385,8 +404,10 @@ async def list_calendars(
         page_token (Optional[str]): Token for the next page, taken from a previous response.
 
     Returns:
-        str: A formatted list of the user's calendars (summary, ID, primary status).
-            When more calendars remain, a "Next page token" line is appended.
+        str: A formatted list of the user's calendars: summary, primary status, ID,
+            access role (owner/writer/reader/freeBusyReader) and time zone, plus
+            hidden / not-selected flags when set. When more calendars remain, a
+            "Next page token" line is appended.
     """
     logger.info(f"[list_calendars] Invoked. Email: '{user_google_email}'")
 
@@ -409,10 +430,7 @@ async def list_calendars(
             )
         return f"No calendars found for {user_google_email}."
 
-    calendars_summary_list = [
-        f'- "{cal.get("summary", "No Summary")}"{" (Primary)" if cal.get("primary") else ""} (ID: {cal["id"]})'
-        for cal in items
-    ]
+    calendars_summary_list = [format_calendar_list_line(cal) for cal in items]
     text_output = (
         f"Successfully listed {len(items)} calendars for {user_google_email}:\n"
         + "\n".join(calendars_summary_list)
@@ -1446,18 +1464,28 @@ async def manage_event(
     *,
     start_timezone: Optional[str] = None,
     end_timezone: Optional[str] = None,
+    destination_calendar_id: Optional[str] = None,
+    text: Optional[str] = None,
+    time_min: Optional[str] = None,
+    time_max: Optional[str] = None,
+    max_results: Optional[int] = None,
+    page_token: Optional[str] = None,
+    show_deleted: bool = False,
+    ical_uid: Optional[str] = None,
 ) -> str:
     """
-    Manages calendar events. Supports creating, updating, deleting, and RSVP.
+    Manages calendar events. Supports creating, updating, deleting, RSVP, moving an
+    event to another calendar, natural-language quick-add, listing the instances of a
+    recurring series, and importing an event by iCalUID.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
-        action (str): Action to perform - "create", "update", "delete", or "rsvp".
-        summary (Optional[str]): Event title (required for create).
+        action (str): Action to perform - "create", "update", "delete", "rsvp", "move", "quick_add", "instances", or "import".
+        summary (Optional[str]): Event title (required for create; optional for import).
         start_time (Optional[str]): Start time (required for create). An RFC3339 UTC offset identifies the exact instant and is preserved. Without an offset, supply start_timezone or timezone. For a local wall-clock time, omit the offset and pass the zone so Google resolves daylight saving; a wrong offset moves the event. Date-only values create all-day events.
         end_time (Optional[str]): End time (required for create). An RFC3339 UTC offset identifies the exact instant and is preserved. Without an offset, supply end_timezone or timezone. All-day end dates are exclusive.
-        event_id (Optional[str]): Event ID (required for update and delete).
-        calendar_id (str): Calendar ID (default: 'primary').
+        event_id (Optional[str]): Event ID (required for update, delete, rsvp and move; for instances, the ID of the recurring series master).
+        calendar_id (str): Calendar ID (default: 'primary'). For move, the calendar the event is currently in.
         description (Optional[str]): Event description.
         location (Optional[str]): Event location.
         attendees (Optional[List[Union[str, Dict[str, Any]]]]): Attendee email addresses, attendee objects (e.g. {"email": ..., "responseStatus": "accepted"}), or a mix of both.
@@ -1498,7 +1526,15 @@ async def manage_event(
         guests_can_see_other_guests (Optional[bool]): Whether attendees can see other guests.
         response (Optional[str]): RSVP response — "accepted", "declined", "tentative", or "needsAction" (rsvp action only).
         rsvp_comment (Optional[str]): Optional message to include with the RSVP response (rsvp action only).
-        send_updates (Optional[str]): Notification behavior for create, update, delete, and rsvp — "all" (default), "externalOnly", or "none".
+        send_updates (Optional[str]): Notification behavior for create, update, delete, rsvp, move and quick_add — "all" (default), "externalOnly", or "none".
+        destination_calendar_id (Optional[str]): Target calendar ID (required for move). Only the organizer's copy of a regular event can be moved.
+        text (Optional[str]): Natural-language event description for quick_add, e.g. "Lunch with Sam tomorrow at 1pm". Google parses the date, time and title.
+        time_min (Optional[str]): For instances: lower bound (inclusive) on each instance's end time, RFC3339 (e.g. '2026-05-01T00:00:00Z' or '2026-05-01').
+        time_max (Optional[str]): For instances: upper bound (exclusive) on each instance's start time, RFC3339.
+        max_results (Optional[int]): For instances: maximum instances per page. Omit to use the API default.
+        page_token (Optional[str]): For instances: token for the next page, taken from a previous response. Keep the other parameters unchanged.
+        show_deleted (bool): For instances: include cancelled occurrences. Defaults to False.
+        ical_uid (Optional[str]): For import: the iCalUID of the existing event to add a private copy of (required). Also pass start_time and end_time (with timezone as needed) and optionally summary, description, location and attendees. No notifications are sent.
 
     Returns:
         str: Confirmation message with event details.
@@ -1613,9 +1649,68 @@ async def manage_event(
             comment=rsvp_comment,
             send_updates=send_updates or "all",
         )
+    elif action_lower == "move":
+        if is_action_denied("calendar", action_lower):
+            raise UserInputError(
+                f"The '{action_lower}' action is not allowed under the current permission level."
+            )
+        if not event_id:
+            raise ValueError("event_id is required for move action")
+        if not destination_calendar_id:
+            raise ValueError("destination_calendar_id is required for move action")
+        return await move_event(
+            service=service,
+            user_google_email=user_google_email,
+            event_id=event_id,
+            calendar_id=calendar_id,
+            destination_calendar_id=destination_calendar_id,
+            send_updates=send_updates or "all",
+        )
+    elif action_lower == "quick_add":
+        if not text:
+            raise ValueError("text is required for quick_add action")
+        return await quick_add_event(
+            service=service,
+            user_google_email=user_google_email,
+            text=text,
+            calendar_id=calendar_id,
+            send_updates=send_updates or "all",
+        )
+    elif action_lower == "instances":
+        if not event_id:
+            raise ValueError("event_id is required for instances action")
+        return await list_event_instances(
+            service=service,
+            user_google_email=user_google_email,
+            event_id=event_id,
+            calendar_id=calendar_id,
+            time_min=_correct_time_format_for_api(time_min, "time_min", None),
+            time_max=_correct_time_format_for_api(time_max, "time_max", None),
+            max_results=max_results,
+            page_token=page_token,
+            show_deleted=show_deleted,
+        )
+    elif action_lower == "import":
+        if not ical_uid:
+            raise ValueError("ical_uid is required for import action")
+        if not start_time or not end_time:
+            raise ValueError("start_time and end_time are required for import action")
+        return await import_event(
+            service=service,
+            user_google_email=user_google_email,
+            calendar_id=calendar_id,
+            ical_uid=ical_uid,
+            start=_build_time_boundary(start_time, start_timezone or timezone),
+            end=_build_time_boundary(end_time, end_timezone or timezone),
+            summary=summary,
+            description=description,
+            location=location,
+            attendees=_normalize_attendees(attendees),
+        )
     else:
         raise ValueError(
-            f"Invalid action '{action_lower}'. Must be 'create', 'update', 'delete', or 'rsvp'."
+            f"Invalid action '{action_lower}'. Must be 'create', 'update', 'delete', "
+            "'rsvp', 'move', 'quick_add', 'instances', or 'import'."
         )
 
 
@@ -2696,3 +2791,268 @@ async def create_calendar(
     calendar_summary = result.get("summary", summary)
     logger.info(f"[create_calendar] Created calendar with ID: {calendar_id}")
     return f"Created calendar '{calendar_summary}' (ID: {calendar_id})"
+
+
+# ---------------------------------------------------------------------------
+# Calendar, calendar-list, sharing (ACL) and settings management
+# ---------------------------------------------------------------------------
+
+_MANAGE_CALENDAR_ACTIONS = (
+    "get",
+    "update",
+    "delete",
+    "clear",
+    "subscribe",
+    "unsubscribe",
+    "update_list_entry",
+)
+
+
+@server.tool(
+    title="Manage Calendar",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("calendar", "calendar")
+@handle_http_errors("manage_calendar", service_type="calendar")
+async def manage_calendar(
+    service,
+    user_google_email: str,
+    action: str,
+    calendar_id: str = "primary",
+    summary: Optional[str] = None,
+    description: Optional[str] = None,
+    location: Optional[str] = None,
+    time_zone: Optional[str] = None,
+    confirm: bool = False,
+    color_id: Optional[str] = None,
+    background_color: Optional[str] = None,
+    foreground_color: Optional[str] = None,
+    hidden: Optional[bool] = None,
+    selected: Optional[bool] = None,
+    default_reminders: Optional[Union[str, List[Dict[str, Any]]]] = None,
+    notification_settings: Optional[
+        Union[str, List[Dict[str, Any]], Dict[str, Any]]
+    ] = None,
+    summary_override: Optional[str] = None,
+) -> str:
+    """
+    Manages a calendar and the user's subscription to it. Inspect or edit a calendar's
+    metadata, delete a secondary calendar, clear the primary calendar, subscribe to or
+    unsubscribe from a calendar, or change how it appears in this user's list. Use
+    `create_calendar` to make a new calendar and `list_calendars` to find IDs.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        action (str): One of "get", "update", "delete", "clear", "subscribe", "unsubscribe", "update_list_entry".
+        calendar_id (str): Calendar ID (default: 'primary'). Required for every action except that 'primary' only makes sense for get, update, clear and update_list_entry.
+        summary (Optional[str]): New calendar title (update).
+        description (Optional[str]): New calendar description (update).
+        location (Optional[str]): New geographic location as free text (update).
+        time_zone (Optional[str]): New IANA time zone for the calendar, e.g. 'Europe/Amsterdam' (update).
+        confirm (bool): Must be True for clear, which permanently deletes EVERY event on the primary calendar. Defaults to False.
+        color_id (Optional[str]): Calendar colour ID from get_calendar_settings (update_list_entry). Mutually exclusive with background_color/foreground_color.
+        background_color (Optional[str]): Hex background colour, e.g. '#0088aa' (update_list_entry).
+        foreground_color (Optional[str]): Hex foreground colour, e.g. '#ffffff' (update_list_entry).
+        hidden (Optional[bool]): Hide the calendar from the list (update_list_entry).
+        selected (Optional[bool]): Whether the calendar's events are shown in the UI (update_list_entry).
+        default_reminders (Optional[Union[str, List[Dict[str, Any]]]]): Default reminders for this user on this calendar, e.g. [{"method": "popup", "minutes": 10}]. An empty list removes them (update_list_entry).
+        notification_settings (Optional[Union[str, List[Dict[str, Any]], Dict[str, Any]]]): Email notifications, e.g. [{"type": "eventCreation", "method": "email"}]. Types: eventCreation, eventChange, eventCancellation, eventResponse, agenda. An empty list disables them (update_list_entry).
+        summary_override (Optional[str]): Personal display name for the calendar in this user's list (update_list_entry).
+
+    Returns:
+        str: Calendar details or a confirmation message.
+    """
+    action_lower = action.lower().strip()
+    logger.info(
+        f"[manage_calendar] Invoked. Email: '{user_google_email}', Action: '{action_lower}', Calendar: '{calendar_id}'"
+    )
+    if action_lower not in _MANAGE_CALENDAR_ACTIONS:
+        raise UserInputError(
+            f"Invalid action '{action}'. Must be one of: {', '.join(_MANAGE_CALENDAR_ACTIONS)}"
+        )
+    if not calendar_id or not calendar_id.strip():
+        raise UserInputError("calendar_id is required.")
+    calendar_id = calendar_id.strip()
+
+    if action_lower in ("delete", "clear", "unsubscribe") and is_action_denied(
+        "calendar", action_lower
+    ):
+        raise UserInputError(
+            f"The '{action_lower}' action is not allowed under the current permission level."
+        )
+
+    if action_lower == "get":
+        return await get_calendar(service, user_google_email, calendar_id)
+    if action_lower == "update":
+        return await update_calendar(
+            service,
+            user_google_email,
+            calendar_id,
+            summary=summary,
+            description=description,
+            location=location,
+            time_zone=time_zone,
+        )
+    if action_lower == "delete":
+        return await delete_calendar(service, user_google_email, calendar_id)
+    if action_lower == "clear":
+        return await clear_calendar(service, user_google_email, calendar_id, confirm)
+    if action_lower == "subscribe":
+        return await subscribe_calendar(service, user_google_email, calendar_id)
+    if action_lower == "unsubscribe":
+        return await unsubscribe_calendar(service, user_google_email, calendar_id)
+    return await update_calendar_list_entry(
+        service,
+        user_google_email,
+        calendar_id,
+        color_id=color_id,
+        background_color=background_color,
+        foreground_color=foreground_color,
+        hidden=hidden,
+        selected=selected,
+        default_reminders=default_reminders,
+        notification_settings=notification_settings,
+        summary_override=summary_override,
+    )
+
+
+_MANAGE_ACL_ACTIONS = ("list", "get", "insert", "update", "delete")
+
+
+@server.tool(
+    title="Manage Calendar Sharing",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("calendar", "calendar")
+@handle_http_errors("manage_calendar_acl", service_type="calendar")
+async def manage_calendar_acl(
+    service,
+    user_google_email: str,
+    action: str,
+    calendar_id: str = "primary",
+    rule_id: Optional[str] = None,
+    scope_type: Optional[str] = None,
+    scope_value: Optional[str] = None,
+    role: Optional[str] = None,
+    send_notifications: Optional[bool] = None,
+    max_results: Optional[int] = None,
+    page_token: Optional[str] = None,
+    show_deleted: bool = False,
+) -> str:
+    """
+    Manages who a calendar is shared with (its access control rules). List the current
+    sharing, share with a user, group or domain (or publicly), change someone's role,
+    or revoke access. Requires owner access to the calendar.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        action (str): One of "list", "get", "insert", "update", "delete".
+        calendar_id (str): Calendar ID (default: 'primary').
+        rule_id (Optional[str]): ACL rule ID such as 'user:someone@example.com', 'group:team@example.com', 'domain:example.com' or 'default' (required for get, update, delete).
+        scope_type (Optional[str]): Who the rule applies to: "user", "group", "domain", or "default" for public access (insert).
+        scope_value (Optional[str]): Email address or domain for the scope (insert; omit for scope_type 'default').
+        role (Optional[str]): Access level: "freeBusyReader", "reader", "writer", "owner", or "none" to revoke (insert, update). Public access is limited to freeBusyReader/reader.
+        send_notifications (Optional[bool]): Whether to email the grantee about the change (insert, update). API default is True.
+        max_results (Optional[int]): Rules per page (list). Omit to use the API default.
+        page_token (Optional[str]): Token for the next page from a previous list response (list).
+        show_deleted (bool): Include revoked rules (role 'none') in list output. Defaults to False.
+
+    Returns:
+        str: The sharing rules or a confirmation message including the rule ID.
+    """
+    action_lower = action.lower().strip()
+    logger.info(
+        f"[manage_calendar_acl] Invoked. Email: '{user_google_email}', Action: '{action_lower}', Calendar: '{calendar_id}'"
+    )
+    if action_lower not in _MANAGE_ACL_ACTIONS:
+        raise UserInputError(
+            f"Invalid action '{action}'. Must be one of: {', '.join(_MANAGE_ACL_ACTIONS)}"
+        )
+    if not calendar_id or not calendar_id.strip():
+        raise UserInputError("calendar_id is required.")
+    calendar_id = calendar_id.strip()
+
+    if action_lower == "delete" and is_action_denied("calendar", "delete_acl"):
+        raise UserInputError(
+            "The 'delete' action is not allowed under the current permission level."
+        )
+
+    if action_lower == "list":
+        return await list_acl_rules(
+            service,
+            user_google_email,
+            calendar_id,
+            max_results=max_results,
+            page_token=page_token,
+            show_deleted=show_deleted,
+        )
+    if action_lower == "insert":
+        return await insert_acl_rule(
+            service,
+            user_google_email,
+            calendar_id,
+            scope_type=scope_type,
+            scope_value=scope_value,
+            role=role,
+            send_notifications=send_notifications,
+        )
+
+    if not rule_id or not rule_id.strip():
+        raise UserInputError(f"rule_id is required for the '{action_lower}' action.")
+    rule_id = rule_id.strip()
+    if action_lower == "get":
+        return await get_acl_rule(service, user_google_email, calendar_id, rule_id)
+    if action_lower == "update":
+        return await update_acl_rule(
+            service,
+            user_google_email,
+            calendar_id,
+            rule_id,
+            role=role,
+            send_notifications=send_notifications,
+        )
+    return await delete_acl_rule(service, user_google_email, calendar_id, rule_id)
+
+
+@server.tool(
+    title="Get Calendar Settings",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("calendar", "calendar_read")
+@handle_http_errors("get_calendar_settings", is_read_only=True, service_type="calendar")
+async def get_calendar_settings(
+    service,
+    user_google_email: str,
+    include_colors: bool = True,
+) -> str:
+    """
+    Retrieves the user's Google Calendar settings (time zone, locale, week start,
+    default event length, etc.) and the colour palettes whose IDs are accepted by
+    `manage_event` (color_id) and `manage_calendar` (update_list_entry).
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        include_colors (bool): Also list the calendar and event colour palettes with their IDs. Defaults to True.
+
+    Returns:
+        str: Settings as "id: value" lines, followed by the colour palettes when requested.
+    """
+    logger.info(f"[get_calendar_settings] Invoked. Email: '{user_google_email}'")
+    return await get_settings_and_colors(
+        service, user_google_email, include_colors=include_colors
+    )

@@ -51,7 +51,10 @@ calendar:
     - query_freebusy
     - manage_out_of_office
     - manage_focus_time
-  complete: []
+  complete:
+    - manage_calendar
+    - manage_calendar_acl
+    - get_calendar_settings
 
 docs:
   core:
