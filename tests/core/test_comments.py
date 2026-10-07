@@ -453,3 +453,403 @@ class TestCommentsEdgeCases:
 
         call_kwargs = mock_service.comments.return_value.list.call_args.kwargs
         assert call_kwargs["pageSize"] == 100
+
+
+# ---------------------------------------------------------------------------
+# Extended manage_comment actions: update / delete / resolve / reopen / replies
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock  # noqa: E402
+
+from core.comments import (  # noqa: E402
+    COMMENT_ACTIONS,
+    _delete_comment_impl,
+    _delete_reply_impl,
+    _list_replies_impl,
+    _manage_comment_dispatch,
+    _reopen_comment_impl,
+    _update_comment_impl,
+    _update_reply_impl,
+)
+
+
+def _mock_full_service():
+    """Mock Drive service covering every comments()/replies() method used."""
+    service = Mock()
+    payload = {
+        "id": "x1",
+        "content": "text",
+        "author": {"displayName": "Alice"},
+        "createdTime": "2025-01-15T10:00:00Z",
+        "modifiedTime": "2025-01-16T10:00:00Z",
+    }
+    for res in (service.comments.return_value, service.replies.return_value):
+        for method in ("create", "update", "get"):
+            getattr(res, method).return_value.execute.return_value = payload
+        res.delete.return_value.execute.return_value = ""
+    service.replies.return_value.list.return_value.execute.return_value = {
+        "replies": []
+    }
+    return service
+
+
+class TestExtendedCommentImpls:
+    @pytest.mark.asyncio
+    async def test_update_comment(self):
+        service = _mock_full_service()
+
+        result = await _update_comment_impl(
+            service, "document", "d1", "c1", "new\ntext"
+        )
+
+        service.comments.return_value.update.assert_called_once_with(
+            fileId="d1",
+            commentId="c1",
+            body={"content": "new\ntext"},
+            fields="id,content,author,createdTime,modifiedTime",
+        )
+        assert result.splitlines() == [
+            "Comment updated successfully!",
+            "Comment ID: x1",
+            "Modified: 2025-01-16T10:00:00Z",
+            "Content: new",
+            " " * 9 + "text",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_delete_comment(self):
+        service = _mock_full_service()
+
+        result = await _delete_comment_impl(service, "spreadsheet", "s1", "c1")
+
+        service.comments.return_value.delete.assert_called_once_with(
+            fileId="s1", commentId="c1"
+        )
+        assert result == "Comment c1 deleted from spreadsheet s1."
+
+    @pytest.mark.asyncio
+    async def test_resolve_default_note_and_action(self):
+        service = _mock_full_service()
+
+        result = await _resolve_comment_impl(service, "document", "d1", "c1")
+
+        body = service.replies.return_value.create.call_args.kwargs["body"]
+        assert body == {
+            "content": "This comment has been resolved.",
+            "action": "resolve",
+        }
+        assert result.startswith("Comment c1 has been resolved successfully.")
+        assert "Resolve reply ID: x1" in result
+
+    @pytest.mark.asyncio
+    async def test_reopen_with_custom_note(self):
+        service = _mock_full_service()
+
+        result = await _reopen_comment_impl(
+            service, "presentation", "p1", "c1", note="Not done yet"
+        )
+
+        body = service.replies.return_value.create.call_args.kwargs["body"]
+        assert body == {"content": "Not done yet", "action": "reopen"}
+        assert result.splitlines()[:2] == [
+            "Comment c1 has been reopened successfully.",
+            "Reopen reply ID: x1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_list_replies_formats_actions_and_deleted(self):
+        service = _mock_full_service()
+        service.replies.return_value.list.return_value.execute.side_effect = [
+            {
+                "replies": [
+                    {
+                        "id": "r1",
+                        "content": "Looks good",
+                        "author": {"displayName": "Bob"},
+                        "createdTime": "2025-01-15T11:00:00Z",
+                    }
+                ],
+                "nextPageToken": "t2",
+            },
+            {
+                "replies": [
+                    {
+                        "id": "r2",
+                        "content": "",
+                        "author": {"displayName": "Cara"},
+                        "createdTime": "2025-01-15T12:00:00Z",
+                        "action": "resolve",
+                        "deleted": True,
+                    }
+                ]
+            },
+        ]
+
+        result = await _list_replies_impl(service, "document", "d1", "c1")
+
+        calls = service.replies.return_value.list.call_args_list
+        assert calls[0].kwargs["fileId"] == "d1"
+        assert calls[0].kwargs["commentId"] == "c1"
+        assert "pageToken" not in calls[0].kwargs
+        assert calls[1].kwargs["pageToken"] == "t2"
+        assert result.splitlines() == [
+            "Found 2 replies on comment c1:",
+            "",
+            "Reply ID: r1",
+            "Author: Bob",
+            "Created: 2025-01-15T11:00:00Z",
+            "Content: Looks good",
+            "",
+            "Reply ID: r2",
+            "Author: Cara",
+            "Created: 2025-01-15T12:00:00Z [RESOLVE] [DELETED]",
+            "Content: ",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_list_replies_empty(self):
+        result = await _list_replies_impl(_mock_full_service(), "document", "d1", "c1")
+        assert result == "No replies found on comment c1 in document d1"
+
+    @pytest.mark.asyncio
+    async def test_update_reply(self):
+        service = _mock_full_service()
+
+        result = await _update_reply_impl(
+            service, "document", "d1", "c1", "r1", "edited"
+        )
+
+        service.replies.return_value.update.assert_called_once_with(
+            fileId="d1",
+            commentId="c1",
+            replyId="r1",
+            body={"content": "edited"},
+            fields="id,content,author,createdTime,modifiedTime",
+        )
+        assert "Reply updated successfully!" in result
+        assert "Content: edited" in result
+
+    @pytest.mark.asyncio
+    async def test_delete_reply(self):
+        service = _mock_full_service()
+
+        result = await _delete_reply_impl(service, "document", "d1", "c1", "r1")
+
+        service.replies.return_value.delete.assert_called_once_with(
+            fileId="d1", commentId="c1", replyId="r1"
+        )
+        assert result == "Reply r1 deleted from comment c1 in document d1."
+
+
+class TestExtendedDispatch:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("action", "kwargs", "resource", "method"),
+        [
+            (
+                "update",
+                {"comment_id": "c1", "comment_content": "x"},
+                "comments",
+                "update",
+            ),
+            ("delete", {"comment_id": "c1"}, "comments", "delete"),
+            ("resolve", {"comment_id": "c1"}, "replies", "create"),
+            ("reopen", {"comment_id": "c1"}, "replies", "create"),
+            ("list_replies", {"comment_id": "c1"}, "replies", "list"),
+            (
+                "update_reply",
+                {"comment_id": "c1", "reply_id": "r1", "comment_content": "x"},
+                "replies",
+                "update",
+            ),
+            (
+                "delete_reply",
+                {"comment_id": "c1", "reply_id": "r1"},
+                "replies",
+                "delete",
+            ),
+        ],
+    )
+    async def test_dispatch_routes_to_api_method(
+        self, action, kwargs, resource, method
+    ):
+        service = _mock_full_service()
+
+        await _manage_comment_dispatch(service, "document", "d1", action, **kwargs)
+
+        getattr(getattr(service, resource).return_value, method).assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_is_case_insensitive(self):
+        service = _mock_full_service()
+        await _manage_comment_dispatch(
+            service, "document", "d1", " LIST_REPLIES ", comment_id="c1"
+        )
+        service.replies.return_value.list.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action",
+        [a for a in COMMENT_ACTIONS if a != "create"],
+    )
+    async def test_comment_id_required_for_everything_but_create(self, action):
+        with pytest.raises(ValueError, match="comment_id is required"):
+            await _manage_comment_dispatch(
+                _mock_full_service(), "document", "d1", action, comment_content="x"
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["update", "update_reply"])
+    async def test_update_actions_require_content(self, action):
+        with pytest.raises(ValueError, match="comment_content is required"):
+            await _manage_comment_dispatch(
+                _mock_full_service(),
+                "document",
+                "d1",
+                action,
+                comment_id="c1",
+                reply_id="r1",
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["update_reply", "delete_reply"])
+    async def test_reply_actions_require_reply_id(self, action):
+        with pytest.raises(ValueError, match="reply_id is required"):
+            await _manage_comment_dispatch(
+                _mock_full_service(),
+                "document",
+                "d1",
+                action,
+                comment_id="c1",
+                comment_content="x",
+            )
+
+    @pytest.mark.asyncio
+    async def test_resolve_passes_optional_note(self):
+        service = _mock_full_service()
+        await _manage_comment_dispatch(
+            service,
+            "document",
+            "d1",
+            "resolve",
+            comment_id="c1",
+            comment_content="Done",
+        )
+        body = service.replies.return_value.create.call_args.kwargs["body"]
+        assert body == {"content": "Done", "action": "resolve"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["update", "delete", "reopen", "list_replies"])
+    async def test_cell_rejected_for_non_create(self, action):
+        with pytest.raises(ValueError, match="only supported for the create"):
+            await _manage_comment_dispatch(
+                _mock_full_service(),
+                "spreadsheet",
+                "s1",
+                action,
+                comment_id="c1",
+                comment_content="x",
+                cell="A1",
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["delete", "delete_reply"])
+    async def test_destructive_actions_respect_permission_denial(self, action):
+        service = _mock_full_service()
+        with patch("core.comments.is_action_denied", return_value=True) as denied:
+            with pytest.raises(ValueError, match="not allowed"):
+                await _manage_comment_dispatch(
+                    service, "document", "d1", action, comment_id="c1", reply_id="r1"
+                )
+        denied.assert_called_once_with("drive", action)
+        service.comments.return_value.delete.assert_not_called()
+        service.replies.return_value.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_destructive_actions_skip_permission_check(self):
+        service = _mock_full_service()
+        with patch("core.comments.is_action_denied", return_value=True):
+            await _manage_comment_dispatch(
+                service,
+                "document",
+                "d1",
+                "update",
+                comment_id="c1",
+                comment_content="x",
+            )
+        service.comments.return_value.update.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_invalid_action_lists_all(self):
+        with pytest.raises(ValueError, match="Invalid action 'archive'") as exc:
+            await _manage_comment_dispatch(
+                _mock_full_service(), "document", "d1", "archive"
+            )
+        for action in COMMENT_ACTIONS:
+            assert action in str(exc.value)
+
+
+class TestExtendedToolRegistrations:
+    """All three manage_comment variants accept reply_id and document the actions."""
+
+    @pytest.mark.parametrize(
+        ("app", "param"),
+        [
+            ("document", "document_id"),
+            ("spreadsheet", "spreadsheet_id"),
+            ("presentation", "presentation_id"),
+        ],
+    )
+    def test_reply_id_param_and_docstring(self, app, param):
+        tools = create_comment_tools(app, param)
+        sig = inspect.signature(tools["manage_comment"])
+        assert "reply_id" in sig.parameters
+        assert sig.parameters["reply_id"].default is None
+        doc = tools["manage_comment"].__doc__ or ""
+        for action in COMMENT_ACTIONS:
+            assert f"- {action}:" in doc, f"{app} docstring missing action {action}"
+
+    @pytest.mark.asyncio
+    async def test_spreadsheet_tool_forwards_reply_id(self):
+        tools = create_comment_tools("spreadsheet", "spreadsheet_id")
+        fn = tools["manage_comment"]
+        while hasattr(fn, "__wrapped__"):
+            fn = fn.__wrapped__
+        with patch(
+            "core.comments._manage_comment_dispatch", new=AsyncMock(return_value="ok")
+        ) as dispatch:
+            result = await fn(
+                Mock(),
+                Mock(),
+                "user@example.com",
+                "s1",
+                "delete_reply",
+                comment_id="c1",
+                reply_id="r1",
+            )
+        assert result == "ok"
+        assert dispatch.call_args.kwargs["reply_id"] == "r1"
+        assert dispatch.call_args.args[3] == "delete_reply"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("app", "param"),
+        [("document", "document_id"), ("presentation", "presentation_id")],
+    )
+    async def test_single_service_tools_forward_reply_id(self, app, param):
+        fn = create_comment_tools(app, param)["manage_comment"]
+        while hasattr(fn, "__wrapped__"):
+            fn = fn.__wrapped__
+        with patch(
+            "core.comments._manage_comment_dispatch", new=AsyncMock(return_value="ok")
+        ) as dispatch:
+            await fn(
+                Mock(),
+                "user@example.com",
+                "f1",
+                "update_reply",
+                comment_content="x",
+                comment_id="c1",
+                reply_id="r1",
+            )
+        assert dispatch.call_args.kwargs["reply_id"] == "r1"

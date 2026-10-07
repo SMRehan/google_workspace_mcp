@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import re
+import uuid
 import zipfile
 import zlib
 from pathlib import Path
@@ -26,15 +27,25 @@ import httpx
 from googleapiclient.errors import HttpError
 from googleapiclient.http import HttpRequest, MediaIoBaseDownload, MediaIoBaseUpload
 
+from auth.permissions import is_action_denied
 from auth.service_decorator import require_google_service
-from core.file_limits import download_media_bytes
+from core.file_limits import (
+    FileTooLargeError,
+    download_media_bytes,
+    ensure_within_file_size_limit,
+)
 from core.http_utils import (
     redact_url as _redact_url,
     ssrf_safe_stream as _ssrf_safe_stream,
 )
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
+    IMAGE_MIME_TYPES,
+    OfficeXmlExtractionError,
     UserInputError,
+    encode_image_content,
+    extract_office_xml_text,
+    extract_pdf_text,
     local_file_access_enabled,
     validate_file_path,
 )
@@ -1590,3 +1601,775 @@ async def _import_with_conversion(
 
     logger.info(f"[{tool_name}] Success. Link: {link}")
     return confirmation
+
+
+# ---------------------------------------------------------------------------
+# Drive file management (trash / move / rename / star / download restriction)
+# ---------------------------------------------------------------------------
+
+FILE_MANAGEMENT_ACTIONS = (
+    "trash",
+    "untrash",
+    "delete",
+    "empty_trash",
+    "move",
+    "rename",
+    "star",
+    "unstar",
+    "set_description",
+    "restrict_download",
+    "allow_download",
+)
+
+# Simple boolean / string field toggles handled by a single files().update call.
+_FILE_FIELD_ACTIONS: Dict[str, Tuple[str, Any]] = {
+    "trash": ("trashed", True),
+    "untrash": ("trashed", False),
+    "star": ("starred", True),
+    "unstar": ("starred", False),
+    "restrict_download": ("copyRequiresWriterPermission", True),
+    "allow_download": ("copyRequiresWriterPermission", False),
+}
+
+_FILE_UPDATE_FIELDS = (
+    "id, name, mimeType, parents, trashed, starred, description, "
+    "copyRequiresWriterPermission, webViewLink, driveId"
+)
+
+
+def _validate_action(
+    tool_name: str, action: str, valid_actions: Tuple[str, ...]
+) -> str:
+    """Normalise *action*, reject unknown ones and ones denied by permissions."""
+    normalized = (action or "").strip().lower()
+    if normalized not in valid_actions:
+        raise UserInputError(
+            f"Invalid action '{action}'. Must be one of: {', '.join(valid_actions)}"
+        )
+    if is_action_denied("drive", normalized):
+        raise UserInputError(
+            f"The '{normalized}' action is not allowed under the current permission level."
+        )
+    return normalized
+
+
+def _format_bytes(size: Any) -> str:
+    """Render a byte count as a human readable string (keeps the raw count)."""
+    try:
+        count = int(size)
+    except (TypeError, ValueError):
+        return "unknown"
+    value = float(count)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{count:,} B"
+            return f"{value:,.1f} {unit} ({count:,} bytes)"
+        value /= 1024
+    return f"{count:,} B"
+
+
+def _file_summary_lines(file_metadata: Dict[str, Any]) -> List[str]:
+    """Standard metadata lines for a Drive file response."""
+    lines = [
+        f"Name: {file_metadata.get('name', 'Unknown')}",
+        f"ID: {file_metadata.get('id', 'Unknown')}",
+    ]
+    if file_metadata.get("mimeType"):
+        lines.append(f"Type: {file_metadata['mimeType']}")
+    parents = file_metadata.get("parents") or []
+    if parents:
+        lines.append(f"Parents: {', '.join(parents)}")
+    if file_metadata.get("driveId"):
+        lines.append(f"Shared drive: {file_metadata['driveId']}")
+    flags = []
+    if file_metadata.get("trashed"):
+        flags.append("trashed")
+    if file_metadata.get("starred"):
+        flags.append("starred")
+    if file_metadata.get("copyRequiresWriterPermission"):
+        flags.append("download restricted for readers/commenters")
+    if flags:
+        lines.append(f"Flags: {', '.join(flags)}")
+    if file_metadata.get("description"):
+        lines.append(f"Description: {file_metadata['description']}")
+    if file_metadata.get("webViewLink"):
+        lines.append(f"Link: {file_metadata['webViewLink']}")
+    return lines
+
+
+async def _update_file_metadata(
+    service, file_id: str, body: Dict[str, Any], **extra_params: Any
+) -> Dict[str, Any]:
+    """Run files().update with shared-drive support and a stable field set."""
+    params: Dict[str, Any] = {
+        "fileId": file_id,
+        "body": body,
+        "supportsAllDrives": True,
+        "fields": _FILE_UPDATE_FIELDS,
+    }
+    params.update(extra_params)
+    return await asyncio.to_thread(service.files().update(**params).execute)
+
+
+async def _manage_drive_file_impl(
+    service,
+    user_google_email: str,
+    action: str,
+    file_id: Optional[str] = None,
+    new_name: Optional[str] = None,
+    new_parent_folder_id: Optional[str] = None,
+    description: Optional[str] = None,
+    drive_id: Optional[str] = None,
+) -> str:
+    """Apply a file-management action to a Drive file, folder or shortcut.
+
+    Shortcuts are NOT followed: trashing, renaming or moving a shortcut acts on
+    the shortcut itself, which is what a user pointing at it expects.
+    """
+    normalized = _validate_action("manage_drive_file", action, FILE_MANAGEMENT_ACTIONS)
+    logger.info(
+        f"[manage_drive_file] Invoked. Email: '{user_google_email}', "
+        f"Action: '{normalized}', File ID: '{file_id}'"
+    )
+
+    if normalized == "empty_trash":
+        params: Dict[str, Any] = {}
+        if drive_id:
+            params["driveId"] = drive_id
+        await asyncio.to_thread(service.files().emptyTrash(**params).execute)
+        scope = f"shared drive {drive_id}" if drive_id else "My Drive"
+        return f"Trash emptied for {scope} ({user_google_email}). Items were permanently deleted."
+
+    if not file_id:
+        raise UserInputError(f"file_id is required for the '{normalized}' action.")
+
+    if normalized == "delete":
+        await asyncio.to_thread(
+            service.files().delete(fileId=file_id, supportsAllDrives=True).execute
+        )
+        return (
+            f"File {file_id} permanently deleted (bypassed the trash). "
+            "This cannot be undone."
+        )
+
+    if normalized in _FILE_FIELD_ACTIONS:
+        field, value = _FILE_FIELD_ACTIONS[normalized]
+        updated = await _update_file_metadata(service, file_id, {field: value})
+        verb = {
+            "trash": "moved to trash",
+            "untrash": "restored from trash",
+            "star": "starred",
+            "unstar": "unstarred",
+            "restrict_download": "download/copy/print restricted for readers and commenters",
+            "allow_download": "download/copy/print allowed for readers and commenters",
+        }[normalized]
+        return "\n".join([f"File {verb}.", *_file_summary_lines(updated)])
+
+    if normalized == "rename":
+        if not new_name or not new_name.strip():
+            raise UserInputError("new_name is required for the 'rename' action.")
+        updated = await _update_file_metadata(
+            service, file_id, {"name": new_name.strip()}
+        )
+        return "\n".join(["File renamed.", *_file_summary_lines(updated)])
+
+    if normalized == "set_description":
+        if description is None:
+            raise UserInputError(
+                "description is required for the 'set_description' action "
+                "(pass an empty string to clear it)."
+            )
+        updated = await _update_file_metadata(
+            service, file_id, {"description": description}
+        )
+        return "\n".join(["Description updated.", *_file_summary_lines(updated)])
+
+    # move
+    if not new_parent_folder_id:
+        raise UserInputError("new_parent_folder_id is required for the 'move' action.")
+    _resolved_id, current = await resolve_drive_item(
+        service, file_id, extra_fields="name", follow_shortcuts=False
+    )
+    target_folder_id = await resolve_folder_id(service, new_parent_folder_id)
+    current_parents = current.get("parents") or []
+    if current_parents == [target_folder_id]:
+        return "\n".join(
+            [
+                f"File is already in folder {target_folder_id}; nothing to do.",
+                *_file_summary_lines({**current, "id": file_id}),
+            ]
+        )
+    extra: Dict[str, Any] = {"addParents": target_folder_id}
+    if current_parents:
+        extra["removeParents"] = ",".join(current_parents)
+    updated = await _update_file_metadata(service, file_id, {}, **extra)
+    previous = ", ".join(current_parents) if current_parents else "(none)"
+    return "\n".join(
+        [
+            f"File moved from {previous} to {target_folder_id}.",
+            *_file_summary_lines(updated),
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# About (quota, user, limits)
+# ---------------------------------------------------------------------------
+
+ABOUT_FIELDS = (
+    "user(displayName, emailAddress, permissionId), "
+    "storageQuota(limit, usage, usageInDrive, usageInDriveTrash), "
+    "maxUploadSize, canCreateDrives, importFormats, exportFormats"
+)
+
+
+async def _get_drive_about_impl(service, user_google_email: str) -> str:
+    """Summarise the Drive account: quota, identity, upload cap and conversions."""
+    logger.info(f"[get_drive_about] Invoked. Email: '{user_google_email}'")
+    about = await asyncio.to_thread(service.about().get(fields=ABOUT_FIELDS).execute)
+
+    user = about.get("user") or {}
+    quota = about.get("storageQuota") or {}
+    limit = quota.get("limit")
+    usage = quota.get("usage")
+    lines = [
+        f"Drive account for {user_google_email}:",
+        f"User: {user.get('displayName', 'Unknown')} <{user.get('emailAddress', 'unknown')}>"
+        + (
+            f" (permission ID: {user['permissionId']})"
+            if user.get("permissionId")
+            else ""
+        ),
+        "",
+        "Storage quota:",
+        f"  Total used: {_format_bytes(usage)}",
+        f"  Limit: {_format_bytes(limit) if limit is not None else 'unlimited'}",
+    ]
+    if limit is not None and usage is not None:
+        try:
+            pct = (int(usage) / int(limit)) * 100 if int(limit) else 0.0
+            lines.append(f"  Used: {pct:.1f}%")
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    lines.append(f"  Used in Drive: {_format_bytes(quota.get('usageInDrive'))}")
+    lines.append(f"  Used in trash: {_format_bytes(quota.get('usageInDriveTrash'))}")
+    lines.append("")
+    lines.append(f"Max upload size: {_format_bytes(about.get('maxUploadSize'))}")
+    lines.append(
+        f"Can create shared drives: {'yes' if about.get('canCreateDrives') else 'no'}"
+    )
+    import_formats = about.get("importFormats") or {}
+    export_formats = about.get("exportFormats") or {}
+    lines.append(
+        f"Import conversions: {len(import_formats)} source types "
+        "(e.g. Office/CSV/text -> Google Docs/Sheets/Slides)"
+    )
+    lines.append(
+        f"Export conversions: {len(export_formats)} Google types "
+        "(Docs/Sheets/Slides/Drawings -> PDF, Office, text, ...)"
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Revisions
+# ---------------------------------------------------------------------------
+
+REVISION_ACTIONS = ("list", "get", "keep_forever", "unkeep", "delete", "download")
+
+REVISION_FIELDS = (
+    "id, modifiedTime, mimeType, size, md5Checksum, keepForever, "
+    "originalFilename, published, publishedLink, exportLinks, "
+    "lastModifyingUser(displayName, emailAddress)"
+)
+
+
+def _revision_user(revision: Dict[str, Any]) -> str:
+    user = revision.get("lastModifyingUser") or {}
+    name = user.get("displayName")
+    email = user.get("emailAddress")
+    if name and email:
+        return f"{name} <{email}>"
+    return name or email or "Unknown"
+
+
+def _format_revision(revision: Dict[str, Any], indent: str = "") -> List[str]:
+    lines = [
+        f"{indent}Revision ID: {revision.get('id', 'Unknown')}",
+        f"{indent}  Modified: {revision.get('modifiedTime', 'Unknown')} by {_revision_user(revision)}",
+    ]
+    if revision.get("size") is not None:
+        lines.append(f"{indent}  Size: {_format_bytes(revision['size'])}")
+    if revision.get("mimeType"):
+        lines.append(f"{indent}  Type: {revision['mimeType']}")
+    if revision.get("originalFilename"):
+        lines.append(f"{indent}  Original filename: {revision['originalFilename']}")
+    if revision.get("md5Checksum"):
+        lines.append(f"{indent}  MD5: {revision['md5Checksum']}")
+    lines.append(
+        f"{indent}  Keep forever: {'yes' if revision.get('keepForever') else 'no'}"
+    )
+    if revision.get("published"):
+        lines.append(
+            f"{indent}  Published: yes"
+            + (
+                f" ({revision['publishedLink']})"
+                if revision.get("publishedLink")
+                else ""
+            )
+        )
+    export_links = revision.get("exportLinks") or {}
+    if export_links:
+        lines.append(f"{indent}  Export formats: {', '.join(sorted(export_links))}")
+    return lines
+
+
+def _render_revision_content(content: bytes, mime_type: str) -> str:
+    """Turn downloaded revision bytes into something a text channel can carry."""
+    if mime_type in IMAGE_MIME_TYPES:
+        return encode_image_content(content, mime_type)
+    if mime_type == "application/pdf":
+        text = extract_pdf_text(content)
+        if text:
+            return text
+        return f"[Could not extract text from PDF ({len(content)} bytes); it may be scanned/image-only.]"
+    if mime_type.startswith("application/vnd.openxmlformats-officedocument."):
+        try:
+            text = extract_office_xml_text(content, mime_type)
+        except OfficeXmlExtractionError as e:
+            text = f"[Could not read '{mime_type}' revision: {e}]"
+        if text:
+            return text
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        digest = hashlib.md5(content).hexdigest()
+        return (
+            f"[Binary content for mimeType '{mime_type}' - {len(content)} bytes, "
+            f"md5 {digest}. Use the Drive UI or exportLinks to retrieve it as a file.]"
+        )
+
+
+async def _manage_drive_revisions_impl(
+    service,
+    user_google_email: str,
+    file_id: str,
+    action: str,
+    revision_id: Optional[str] = None,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+) -> str:
+    """List, inspect, pin, delete or download the revisions of a Drive file."""
+    normalized = _validate_action("manage_drive_revisions", action, REVISION_ACTIONS)
+    logger.info(
+        f"[manage_drive_revisions] Invoked. Email: '{user_google_email}', "
+        f"File ID: '{file_id}', Action: '{normalized}', Revision: '{revision_id}'"
+    )
+    if not file_id:
+        raise UserInputError("file_id is required.")
+
+    if normalized == "list":
+        params: Dict[str, Any] = {
+            "fileId": file_id,
+            "pageSize": min(max(int(page_size or 100), 1), 1000),
+            "fields": f"nextPageToken, revisions({REVISION_FIELDS})",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        response = await asyncio.to_thread(service.revisions().list(**params).execute)
+        revisions = response.get("revisions") or []
+        if not revisions:
+            return (
+                f"No revisions found for file {file_id}. Google-native files only "
+                "expose revisions to users with edit access; binary files keep up to "
+                "100 revisions for 30 days unless keep_forever is set."
+            )
+        lines = [f"Found {len(revisions)} revisions for file {file_id}:", ""]
+        for revision in revisions:
+            lines.extend(_format_revision(revision))
+            lines.append("")
+        next_token = response.get("nextPageToken")
+        if next_token:
+            lines.append(f"nextPageToken: {next_token}")
+        return "\n".join(lines).rstrip()
+
+    if not revision_id:
+        raise UserInputError(f"revision_id is required for the '{normalized}' action.")
+
+    if normalized == "get":
+        revision = await asyncio.to_thread(
+            service.revisions()
+            .get(fileId=file_id, revisionId=revision_id, fields=REVISION_FIELDS)
+            .execute
+        )
+        return "\n".join([f"Revision of file {file_id}:", *_format_revision(revision)])
+
+    if normalized in ("keep_forever", "unkeep"):
+        keep = normalized == "keep_forever"
+        revision = await asyncio.to_thread(
+            service.revisions()
+            .update(
+                fileId=file_id,
+                revisionId=revision_id,
+                body={"keepForever": keep},
+                fields=REVISION_FIELDS,
+            )
+            .execute
+        )
+        status = (
+            "will be kept forever"
+            if keep
+            else "is no longer pinned (subject to Drive's automatic purge)"
+        )
+        return "\n".join(
+            [f"Revision {revision_id} {status}.", *_format_revision(revision)]
+        )
+
+    if normalized == "delete":
+        await asyncio.to_thread(
+            service.revisions().delete(fileId=file_id, revisionId=revision_id).execute
+        )
+        return (
+            f"Revision {revision_id} of file {file_id} permanently deleted. "
+            "The head revision and Google-native file revisions cannot be deleted."
+        )
+
+    # download
+    revision = await asyncio.to_thread(
+        service.revisions()
+        .get(fileId=file_id, revisionId=revision_id, fields=REVISION_FIELDS)
+        .execute
+    )
+    mime_type = revision.get("mimeType", "") or ""
+    header = [
+        f"Revision {revision_id} of file {file_id}",
+        f"Modified: {revision.get('modifiedTime', 'Unknown')} by {_revision_user(revision)}",
+        f"Type: {mime_type or 'unknown'}",
+    ]
+    if mime_type.startswith(GOOGLE_APPS_MIME_PREFIX):
+        export_links = revision.get("exportLinks") or {}
+        lines = header + [
+            "",
+            "Google-native revisions have no raw bytes to download via the Drive API "
+            "(revisions.get_media is only for binary files).",
+        ]
+        if export_links:
+            lines.append(
+                "Export this revision with an authenticated GET to one of these links:"
+            )
+            for export_mime, link in sorted(export_links.items()):
+                lines.append(f"  - {export_mime}: {link}")
+        else:
+            lines.append(
+                "No exportLinks were returned for this revision; open the file's "
+                "version history in the Google editor instead."
+            )
+        return "\n".join(lines)
+
+    label = revision.get("originalFilename") or f"revision {revision_id}"
+    try:
+        ensure_within_file_size_limit(
+            revision.get("size"), file_name=label, file_id=file_id, kind="revision"
+        )
+        content = await download_media_bytes(
+            service.revisions().get_media(fileId=file_id, revisionId=revision_id),
+            file_name=label,
+            file_id=file_id,
+            kind="revision",
+        )
+    except FileTooLargeError as e:
+        return str(e)
+    body = await asyncio.to_thread(_render_revision_content, content, mime_type)
+    header.append(f"Size: {_format_bytes(len(content))}")
+    return "\n".join(header) + "\n\n--- CONTENT ---\n" + body
+
+
+# ---------------------------------------------------------------------------
+# Changes feed
+# ---------------------------------------------------------------------------
+
+CHANGES_ACTIONS = ("get_start_token", "list")
+
+CHANGES_FIELDS = (
+    "nextPageToken, newStartPageToken, "
+    "changes(changeType, fileId, driveId, removed, time, "
+    "file(id, name, mimeType, trashed, parents), drive(id, name))"
+)
+
+
+def _format_change(change: Dict[str, Any]) -> str:
+    change_type = change.get("changeType") or change.get("type") or "file"
+    removed = bool(change.get("removed"))
+    when = change.get("time", "unknown time")
+    if change_type == "drive":
+        drive = change.get("drive") or {}
+        drive_id = change.get("driveId") or drive.get("id") or "unknown"
+        if removed:
+            return (
+                f"- [{when}] shared drive {drive_id} removed (deleted or access lost)"
+            )
+        return f'- [{when}] shared drive "{drive.get("name", "Unknown")}" (ID: {drive_id}) changed'
+    file_id = change.get("fileId", "unknown")
+    if removed:
+        return f"- [{when}] file {file_id} removed (deleted permanently or access lost)"
+    file_info = change.get("file") or {}
+    flags = " [trashed]" if file_info.get("trashed") else ""
+    drive_suffix = (
+        f", shared drive {change['driveId']}" if change.get("driveId") else ""
+    )
+    return (
+        f'- [{when}] "{file_info.get("name", "Unknown")}" (ID: {file_id}, '
+        f"Type: {file_info.get('mimeType', 'unknown')}{drive_suffix}){flags}"
+    )
+
+
+async def _list_drive_changes_impl(
+    service,
+    user_google_email: str,
+    action: str,
+    page_token: Optional[str] = None,
+    drive_id: Optional[str] = None,
+    page_size: int = 100,
+    include_removed: bool = True,
+    restrict_to_my_drive: bool = False,
+) -> str:
+    """Fetch a start token or one page of changes from the Drive changes feed."""
+    normalized = _validate_action("list_drive_changes", action, CHANGES_ACTIONS)
+    logger.info(
+        f"[list_drive_changes] Invoked. Email: '{user_google_email}', "
+        f"Action: '{normalized}', Drive ID: '{drive_id}'"
+    )
+
+    if normalized == "get_start_token":
+        params: Dict[str, Any] = {"supportsAllDrives": True}
+        if drive_id:
+            params["driveId"] = drive_id
+        response = await asyncio.to_thread(
+            service.changes().getStartPageToken(**params).execute
+        )
+        token = response.get("startPageToken", "")
+        scope = f"shared drive {drive_id}" if drive_id else "all drives"
+        return (
+            f"Start page token for {scope}: {token}\n"
+            "Store it and pass it as page_token with action='list' to receive "
+            "every change made from now on."
+        )
+
+    if not page_token:
+        raise UserInputError(
+            "page_token is required for the 'list' action; obtain one with "
+            "action='get_start_token' or from a previous 'list' response."
+        )
+    params = {
+        "pageToken": page_token,
+        "pageSize": min(max(int(page_size or 100), 1), 1000),
+        "includeRemoved": bool(include_removed),
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+        "fields": CHANGES_FIELDS,
+    }
+    if drive_id:
+        params["driveId"] = drive_id
+    if restrict_to_my_drive:
+        params["restrictToMyDrive"] = True
+    response = await asyncio.to_thread(service.changes().list(**params).execute)
+    changes = response.get("changes") or []
+    lines = [f"{len(changes)} change(s) since token {page_token}:"]
+    lines.extend(_format_change(c) for c in changes)
+    next_token = response.get("nextPageToken")
+    new_start = response.get("newStartPageToken")
+    lines.append("")
+    if next_token:
+        lines.append(
+            f"More changes available. nextPageToken: {next_token} "
+            "(pass it as page_token to continue)."
+        )
+    if new_start:
+        lines.append(
+            f"End of changes reached. newStartPageToken: {new_start} "
+            "(store it for the next poll)."
+        )
+    return "\n".join(lines).rstrip()
+
+
+# ---------------------------------------------------------------------------
+# Shared drives
+# ---------------------------------------------------------------------------
+
+SHARED_DRIVE_ACTIONS = ("list", "get", "create", "update", "delete", "hide", "unhide")
+
+SHARED_DRIVE_RESTRICTION_KEYS = frozenset(
+    {
+        "adminManagedRestrictions",
+        "copyRequiresWriterPermission",
+        "domainUsersOnly",
+        "driveMembersOnly",
+        "sharingFoldersRequiresOrganizerPermission",
+        "downloadRestriction",
+    }
+)
+
+SHARED_DRIVE_FIELDS = (
+    "id, name, createdTime, hidden, colorRgb, themeId, orgUnitId, restrictions, "
+    "capabilities(canAddChildren, canChangeDriveMembersOnlyRestriction, "
+    "canDeleteDrive, canEdit, canManageMembers, canRenameDrive, canShare, "
+    "canTrashChildren)"
+)
+
+
+def _format_shared_drive(drive: Dict[str, Any]) -> List[str]:
+    lines = [
+        f"Name: {drive.get('name', 'Unknown')}",
+        f"ID: {drive.get('id', 'Unknown')}",
+    ]
+    if drive.get("createdTime"):
+        lines.append(f"Created: {drive['createdTime']}")
+    lines.append(f"Hidden: {'yes' if drive.get('hidden') else 'no'}")
+    if drive.get("orgUnitId"):
+        lines.append(f"Org unit: {drive['orgUnitId']}")
+    restrictions = drive.get("restrictions") or {}
+    active = [k for k, v in restrictions.items() if v]
+    lines.append(f"Restrictions: {', '.join(sorted(active)) if active else 'none'}")
+    caps = drive.get("capabilities") or {}
+    active_caps = [k for k, v in caps.items() if v]
+    if active_caps:
+        lines.append(f"Capabilities: {', '.join(sorted(active_caps))}")
+    return lines
+
+
+def _validate_shared_drive_restrictions(
+    restrictions: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not isinstance(restrictions, dict):
+        raise UserInputError(
+            "restrictions must be an object mapping restriction names to booleans."
+        )
+    unknown = set(restrictions) - SHARED_DRIVE_RESTRICTION_KEYS
+    if unknown:
+        raise UserInputError(
+            f"Unknown restriction(s): {', '.join(sorted(unknown))}. Valid keys: "
+            f"{', '.join(sorted(SHARED_DRIVE_RESTRICTION_KEYS))}"
+        )
+    cleaned: Dict[str, Any] = {}
+    for key, value in restrictions.items():
+        if key == "downloadRestriction":
+            if not isinstance(value, dict):
+                raise UserInputError(
+                    "downloadRestriction must be an object, e.g. "
+                    '{"restrictedForReaders": true, "restrictedForWriters": false}.'
+                )
+            cleaned[key] = value
+        elif isinstance(value, bool):
+            cleaned[key] = value
+        else:
+            raise UserInputError(f"Restriction '{key}' must be true or false.")
+    return cleaned
+
+
+async def _manage_shared_drive_impl(
+    service,
+    user_google_email: str,
+    action: str,
+    drive_id: Optional[str] = None,
+    name: Optional[str] = None,
+    restrictions: Optional[Dict[str, Any]] = None,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+    query: Optional[str] = None,
+    use_domain_admin_access: bool = False,
+    allow_item_deletion: bool = False,
+) -> str:
+    """List, inspect, create, update, delete, hide or unhide shared drives."""
+    normalized = _validate_action("manage_shared_drive", action, SHARED_DRIVE_ACTIONS)
+    logger.info(
+        f"[manage_shared_drive] Invoked. Email: '{user_google_email}', "
+        f"Action: '{normalized}', Drive ID: '{drive_id}'"
+    )
+
+    if normalized == "list":
+        return await _list_shared_drives_impl(
+            service,
+            user_google_email,
+            page_size=page_size,
+            page_token=page_token,
+            query=query,
+        )
+
+    if normalized == "create":
+        if not name or not name.strip():
+            raise UserInputError("name is required for the 'create' action.")
+        body: Dict[str, Any] = {"name": name.strip()}
+        if restrictions is not None:
+            body["restrictions"] = _validate_shared_drive_restrictions(restrictions)
+        request_id = str(uuid.uuid4())
+        drive = await asyncio.to_thread(
+            service.drives()
+            .create(requestId=request_id, body=body, fields=SHARED_DRIVE_FIELDS)
+            .execute
+        )
+        return "\n".join(
+            [
+                f"Shared drive created (request ID {request_id}).",
+                *_format_shared_drive(drive),
+            ]
+        )
+
+    if not drive_id:
+        raise UserInputError(f"drive_id is required for the '{normalized}' action.")
+
+    admin: Dict[str, Any] = (
+        {"useDomainAdminAccess": True} if use_domain_admin_access else {}
+    )
+
+    if normalized == "get":
+        drive = await asyncio.to_thread(
+            service.drives()
+            .get(driveId=drive_id, fields=SHARED_DRIVE_FIELDS, **admin)
+            .execute
+        )
+        return "\n".join(["Shared drive:", *_format_shared_drive(drive)])
+
+    if normalized == "update":
+        body = {}
+        if name is not None and name.strip():
+            body["name"] = name.strip()
+        if restrictions is not None:
+            body["restrictions"] = _validate_shared_drive_restrictions(restrictions)
+        if not body:
+            raise UserInputError(
+                "Provide name and/or restrictions for the 'update' action."
+            )
+        drive = await asyncio.to_thread(
+            service.drives()
+            .update(driveId=drive_id, body=body, fields=SHARED_DRIVE_FIELDS, **admin)
+            .execute
+        )
+        return "\n".join(["Shared drive updated.", *_format_shared_drive(drive)])
+
+    if normalized == "delete":
+        params: Dict[str, Any] = {"driveId": drive_id, **admin}
+        if allow_item_deletion:
+            params["allowItemDeletion"] = True
+        await asyncio.to_thread(service.drives().delete(**params).execute)
+        note = (
+            " Its contents were deleted too (allow_item_deletion=True)."
+            if allow_item_deletion
+            else " Only empty shared drives can be deleted without allow_item_deletion."
+        )
+        return f"Shared drive {drive_id} permanently deleted.{note}"
+
+    if normalized == "hide":
+        drive = await asyncio.to_thread(
+            service.drives().hide(driveId=drive_id, fields=SHARED_DRIVE_FIELDS).execute
+        )
+        return "\n".join(
+            ["Shared drive hidden from the default view.", *_format_shared_drive(drive)]
+        )
+
+    drive = await asyncio.to_thread(
+        service.drives().unhide(driveId=drive_id, fields=SHARED_DRIVE_FIELDS).execute
+    )
+    return "\n".join(
+        ["Shared drive restored to the default view.", *_format_shared_drive(drive)]
+    )

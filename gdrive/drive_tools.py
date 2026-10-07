@@ -66,6 +66,11 @@ from gdrive.drive_helpers import (
     UPLOAD_CHUNK_SIZE_BYTES,
     _create_drive_folder_impl,
     _decode_base64_upload,
+    _get_drive_about_impl,
+    _list_drive_changes_impl,
+    _manage_drive_file_impl,
+    _manage_drive_revisions_impl,
+    _manage_shared_drive_impl,
     _download_file_bytes,
     _download_file_to_temp,
     _get_content_update_lock,
@@ -2892,3 +2897,282 @@ async def set_drive_file_permissions(
     output_parts.extend(["", f"View link: {file_metadata.get('webViewLink', 'N/A')}"])
 
     return "\n".join(output_parts)
+
+
+@server.tool(
+    title="Manage Drive File",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("manage_drive_file", is_read_only=False, service_type="drive")
+@require_google_service("drive", "drive_file")
+async def manage_drive_file(
+    service,
+    user_google_email: str,
+    action: str,
+    file_id: Optional[str] = None,
+    new_name: Optional[str] = None,
+    new_parent_folder_id: Optional[str] = None,
+    description: Optional[str] = None,
+    drive_id: Optional[str] = None,
+) -> str:
+    """
+    Manage the lifecycle and metadata of a Drive file, folder or shortcut.
+
+    Works on My Drive and shared-drive items. Shortcuts are acted on directly
+    (renaming or trashing a shortcut does not touch its target).
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        action (str): One of:
+            - "trash": Move the item to the trash (recoverable for 30 days).
+            - "untrash": Restore the item from the trash.
+            - "delete": Permanently delete the item, bypassing the trash. Irreversible.
+            - "empty_trash": Permanently delete everything in the trash. Irreversible.
+              No file_id needed; pass drive_id to empty a shared drive's trash.
+            - "move": Move the item into new_parent_folder_id (replaces its parents).
+            - "rename": Rename the item to new_name.
+            - "star" / "unstar": Toggle the star.
+            - "set_description": Set the item's description (empty string clears it).
+            - "restrict_download": Disable download, print and copy for readers and commenters.
+            - "allow_download": Re-enable download, print and copy for readers and commenters.
+        file_id (Optional[str]): ID of the file, folder or shortcut. Required for every
+            action except "empty_trash".
+        new_name (Optional[str]): New name. Required for "rename".
+        new_parent_folder_id (Optional[str]): Destination folder ID. Required for "move".
+        description (Optional[str]): Description text. Required for "set_description".
+        drive_id (Optional[str]): Shared drive ID. Used only by "empty_trash".
+
+    Returns:
+        str: Confirmation with the item's updated metadata.
+    """
+    return await _manage_drive_file_impl(
+        service,
+        user_google_email,
+        action,
+        file_id=file_id,
+        new_name=new_name,
+        new_parent_folder_id=new_parent_folder_id,
+        description=description,
+        drive_id=drive_id,
+    )
+
+
+@server.tool(
+    title="Get Drive About",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("get_drive_about", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def get_drive_about(
+    service,
+    user_google_email: str,
+) -> str:
+    """
+    Report the Drive account's storage quota, identity and limits.
+
+    Includes total usage vs. limit, bytes used in Drive and in the trash, the
+    authenticated user, the maximum upload size, how many import/export
+    conversions are available and whether the user can create shared drives.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+
+    Returns:
+        str: Human-readable account summary.
+    """
+    return await _get_drive_about_impl(service, user_google_email)
+
+
+@server.tool(
+    title="Manage Drive Revisions",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("manage_drive_revisions", is_read_only=False, service_type="drive")
+@require_google_service("drive", "drive_file")
+async def manage_drive_revisions(
+    service,
+    user_google_email: str,
+    file_id: str,
+    action: str,
+    revision_id: Optional[str] = None,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+) -> str:
+    """
+    List, inspect, pin, delete or download the version history of a Drive file.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): ID of the file whose revisions to manage. Required.
+        action (str): One of:
+            - "list": List revisions (ID, modified time and user, size, keep-forever flag).
+            - "get": Show one revision's metadata. Requires revision_id.
+            - "keep_forever": Pin a revision so Drive never auto-purges it. Requires revision_id.
+            - "unkeep": Remove the pin. Requires revision_id.
+            - "delete": Permanently delete a revision. Requires revision_id. Irreversible;
+              not allowed for the head revision or Google Docs/Sheets/Slides files.
+            - "download": Return the revision's content. Binary files are downloaded
+              (text decoded, images base64, PDF/Office text extracted) subject to
+              WORKSPACE_MCP_MAX_FILE_BYTES; Google-native files return their export links.
+        revision_id (Optional[str]): Revision ID from "list". Required for all but "list".
+        page_size (int): Revisions per page for "list" (1-1000). Defaults to 100.
+        page_token (Optional[str]): Continuation token for "list".
+
+    Returns:
+        str: Revision details, confirmation, or revision content.
+    """
+    return await _manage_drive_revisions_impl(
+        service,
+        user_google_email,
+        file_id,
+        action,
+        revision_id=revision_id,
+        page_size=page_size,
+        page_token=page_token,
+    )
+
+
+@server.tool(
+    title="List Drive Changes",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("list_drive_changes", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def list_drive_changes(
+    service,
+    user_google_email: str,
+    action: str = "list",
+    page_token: Optional[str] = None,
+    drive_id: Optional[str] = None,
+    page_size: int = 100,
+    include_removed: bool = True,
+    restrict_to_my_drive: bool = False,
+) -> str:
+    """
+    Poll the Drive changes feed: what was created, edited, trashed, deleted or unshared.
+
+    Typical flow: call with action="get_start_token" once, store the token, then call
+    action="list" with that token whenever you want to catch up. Each "list" response
+    ends with either a nextPageToken (more to fetch) or a newStartPageToken (store it
+    for the next poll).
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        action (str): "get_start_token" to obtain a baseline token, or "list" (default)
+            to fetch changes since page_token.
+        page_token (Optional[str]): Token from get_start_token or a previous list.
+            Required for "list".
+        drive_id (Optional[str]): Restrict to one shared drive. Omit for the user's
+            whole corpus (My Drive plus all shared drives).
+        page_size (int): Max changes per page (1-1000). Defaults to 100.
+        include_removed (bool): Include deleted / unshared items as "removed" entries.
+            Defaults to True.
+        restrict_to_my_drive (bool): Only report changes inside My Drive. Defaults to False.
+
+    Returns:
+        str: Change list with fileId, name, mimeType, removed flag and time, plus the
+             token to use next.
+    """
+    return await _list_drive_changes_impl(
+        service,
+        user_google_email,
+        action,
+        page_token=page_token,
+        drive_id=drive_id,
+        page_size=page_size,
+        include_removed=include_removed,
+        restrict_to_my_drive=restrict_to_my_drive,
+    )
+
+
+@server.tool(
+    title="Manage Shared Drive",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("manage_shared_drive", is_read_only=False, service_type="drive")
+@require_google_service("drive", "drive_full")
+async def manage_shared_drive(
+    service,
+    user_google_email: str,
+    action: str,
+    drive_id: Optional[str] = None,
+    name: Optional[str] = None,
+    restrictions: Optional[Dict[str, Any]] = None,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+    query: Optional[str] = None,
+    use_domain_admin_access: bool = False,
+    allow_item_deletion: bool = False,
+) -> str:
+    """
+    Manage shared drives (Google Workspace only; consumer Gmail accounts cannot
+    create or own shared drives).
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        action (str): One of:
+            - "list": List shared drives the user can access.
+            - "get": Show one shared drive. Requires drive_id.
+            - "create": Create a shared drive named `name` (a unique requestId is generated).
+            - "update": Rename and/or change restrictions. Requires drive_id and
+              name and/or restrictions.
+            - "delete": Permanently delete a shared drive. Requires drive_id. Irreversible;
+              the drive must be empty unless allow_item_deletion is True.
+            - "hide" / "unhide": Hide the drive from, or restore it to, the default view.
+              Requires drive_id.
+        drive_id (Optional[str]): Shared drive ID. Required for all but "list" and "create".
+        name (Optional[str]): Drive name for "create" (required) or "update".
+        restrictions (Optional[Dict[str, Any]]): For "create"/"update". Boolean keys:
+            adminManagedRestrictions, copyRequiresWriterPermission, domainUsersOnly,
+            driveMembersOnly, sharingFoldersRequiresOrganizerPermission; and
+            downloadRestriction as an object {"restrictedForReaders": bool,
+            "restrictedForWriters": bool}.
+        page_size (int): Drives per page for "list" (1-100). Defaults to 100.
+        page_token (Optional[str]): Continuation token for "list".
+        query (Optional[str]): Drive search query for "list", e.g. "name contains 'Finance'".
+        use_domain_admin_access (bool): Act as a Workspace admin for "get", "update"
+            and "delete". Defaults to False.
+        allow_item_deletion (bool): For "delete", also delete the drive's contents.
+            Defaults to False.
+
+    Returns:
+        str: Shared drive details or a confirmation message.
+    """
+    return await _manage_shared_drive_impl(
+        service,
+        user_google_email,
+        action,
+        drive_id=drive_id,
+        name=name,
+        restrictions=restrictions,
+        page_size=page_size,
+        page_token=page_token,
+        query=query,
+        use_domain_admin_access=use_domain_admin_access,
+        allow_item_deletion=allow_item_deletion,
+    )

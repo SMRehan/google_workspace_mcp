@@ -40,6 +40,11 @@ drive:
   complete:
     - get_drive_file_permissions
     - check_drive_file_public_access
+    - manage_drive_file
+    - get_drive_about
+    - manage_drive_revisions
+    - list_drive_changes
+    - manage_shared_drive
 
 calendar:
   core:
