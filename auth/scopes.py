@@ -45,6 +45,8 @@ CHAT_SPACES_READONLY_SCOPE = "https://www.googleapis.com/auth/chat.spaces.readon
 CHAT_MEMBERSHIPS_READONLY_SCOPE = (
     "https://www.googleapis.com/auth/chat.memberships.readonly"
 )
+CHAT_MEMBERSHIPS_SCOPE = "https://www.googleapis.com/auth/chat.memberships"
+CHAT_DELETE_SCOPE = "https://www.googleapis.com/auth/chat.delete"
 
 # Google Sheets API scopes
 SHEETS_READONLY_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
@@ -116,6 +118,7 @@ SCOPE_HIERARCHY = {
     CONTACTS_SCOPE: {CONTACTS_READONLY_SCOPE},
     CHAT_WRITE_SCOPE: {CHAT_READONLY_SCOPE},
     CHAT_SPACES_SCOPE: {CHAT_SPACES_READONLY_SCOPE},
+    CHAT_MEMBERSHIPS_SCOPE: {CHAT_MEMBERSHIPS_READONLY_SCOPE},
     FORMS_BODY_SCOPE: {FORMS_BODY_READONLY_SCOPE},
     SCRIPT_PROJECTS_SCOPE: {SCRIPT_PROJECTS_READONLY_SCOPE},
     SCRIPT_DEPLOYMENTS_SCOPE: {SCRIPT_DEPLOYMENTS_READONLY_SCOPE},
@@ -177,6 +180,8 @@ CHAT_SCOPES = [
     CHAT_SPACES_SCOPE,
     CHAT_SPACES_READONLY_SCOPE,
     CHAT_MEMBERSHIPS_READONLY_SCOPE,  # Names DMs after their members
+    CHAT_MEMBERSHIPS_SCOPE,  # manage_chat_member add/update_role/remove
+    CHAT_DELETE_SCOPE,  # manage_chat_space delete
     CONTACTS_READONLY_SCOPE,  # Resolves sender and member names via People API
 ]
 

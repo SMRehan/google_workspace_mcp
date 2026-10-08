@@ -107,7 +107,12 @@ chat:
   extended:
     - list_spaces
     - download_chat_attachment
-  complete: []
+  complete:
+    - manage_chat_member
+    - manage_chat_message
+    - manage_chat_reaction
+    - find_chat_direct_message
+    - manage_chat_space
 
 forms:
   core:
