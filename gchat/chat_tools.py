@@ -22,12 +22,42 @@ from core.file_limits import FileTooLargeError, download_http_url_bytes
 from core.server import server
 from core.utils import TransientNetworkError, UserInputError, handle_http_errors
 from gchat.chat_helpers import (
+    _CREATE_SPACE_TYPES,
+    _HISTORY_STATES,
+    _MEMBER_ROLES,
+    _MEMBER_TYPES,
+    _MESSAGE_NAME_RE,
+    _REACTION_NAME_RE,
+    _SETUP_SPACE_TYPES,
+    _SPACE_NAME_RE,
+    _add_member,
+    _create_space,
+    _delete_message,
+    _delete_reaction,
+    _delete_space,
+    _deny_if_restricted,
     _execute_chat_request,
     _extract_rich_links,
+    _find_direct_message,
+    _get_member,
+    _get_message,
+    _list_members,
+    _list_reactions,
     _name_spaces,
     _none_if_blank,
     _none_if_null_sentinel,
+    _remove_member,
+    _require_action,
+    _require_arg,
+    _require_choice,
+    _require_resource_name,
+    _resolve_membership_name,
     _resolve_sender,
+    _search_spaces,
+    _setup_space,
+    _update_member_role,
+    _update_message,
+    _update_space,
 )
 
 logger = logging.getLogger(__name__)
@@ -738,3 +768,355 @@ async def download_chat_attachment(
         f"[download_chat_attachment] Saved {size_kb:.1f} KB attachment to {result.path}"
     )
     return "\n".join(result_lines)
+
+
+@server.tool(
+    title="Manage Chat Member",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_memberships")
+@handle_http_errors("manage_chat_member", service_type="chat")
+async def manage_chat_member(
+    service,
+    user_google_email: str,
+    action: str,
+    space_id: Optional[str] = None,
+    membership_name: Optional[str] = None,
+    member: Optional[str] = None,
+    role: Optional[str] = None,
+    member_type: Optional[str] = None,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+    show_invited: bool = False,
+) -> str:
+    """
+    Lists, inspects, adds, re-roles, or removes members of a Google Chat space.
+
+    Requires a Google Workspace account; the Chat API rejects consumer accounts.
+
+    Args:
+        action: One of "list", "get", "add", "update_role", "remove".
+        space_id: Space resource name (spaces/X). Required for "list" and "add";
+            with 'member' it also identifies the membership for the other actions.
+        membership_name: Membership resource name (spaces/X/members/Y) for "get",
+            "update_role", "remove". Alternatively pass space_id plus member.
+        member: The person as an email address or users/ID, or "app" for the
+            calling Chat app. Required for "add"; identifies the membership
+            together with space_id for "get", "update_role", "remove".
+        role: "ROLE_MEMBER" or "ROLE_MANAGER". Required for "update_role";
+            optional for "add" (a manager role is applied with a follow-up update).
+        member_type: "HUMAN" or "BOT". Filters "list"; sets the type for "add"
+            (default HUMAN).
+        page_size: Members per page for "list" (default 100).
+        page_token: Continue a previous "list" from its nextPageToken.
+        show_invited: For "list", also include invited-but-not-joined members.
+
+    Returns:
+        str: Result of the requested action.
+    """
+    action = _require_action(action, ("list", "get", "add", "update_role", "remove"))
+    logger.info(
+        f"[manage_chat_member] Email: '{user_google_email}', Action: '{action}', Space: '{space_id}'"
+    )
+    _deny_if_restricted(action)
+
+    role = _require_choice(role, "role", _MEMBER_ROLES)
+    member_type = _require_choice(member_type, "member_type", _MEMBER_TYPES)
+
+    if action == "list":
+        space = _require_resource_name(
+            space_id, "space_id", action, _SPACE_NAME_RE, "spaces/X"
+        )
+        return await _list_members(
+            service,
+            space,
+            role,
+            member_type,
+            page_size,
+            _none_if_blank(page_token),
+            show_invited,
+        )
+
+    if action == "add":
+        space = _require_resource_name(
+            space_id, "space_id", action, _SPACE_NAME_RE, "spaces/X"
+        )
+        who = _require_arg(member, "member", action)
+        return await _add_member(service, space, who, role, member_type or "HUMAN")
+
+    name = _resolve_membership_name(action, membership_name, space_id, member)
+    if action == "get":
+        return await _get_member(service, name)
+    if action == "update_role":
+        if role is None:
+            raise UserInputError("'role' is required for the 'update_role' action.")
+        return await _update_member_role(service, name, role)
+    return await _remove_member(service, name)
+
+
+@server.tool(
+    title="Manage Chat Message",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_write")
+@handle_http_errors("manage_chat_message", service_type="chat")
+async def manage_chat_message(
+    service,
+    user_google_email: str,
+    action: str,
+    message_name: str,
+    text: Optional[str] = None,
+    update_mask: Optional[str] = None,
+    force: bool = False,
+) -> str:
+    """
+    Gets, edits, or deletes a single Google Chat message by resource name.
+
+    Requires a Google Workspace account; the Chat API rejects consumer accounts.
+    Only the author can edit or delete their own message.
+
+    Args:
+        action: One of "get", "update", "delete".
+        message_name: Message resource name (spaces/X/messages/Y), as returned by
+            send_message or get_messages.
+        text: New message text for "update".
+        update_mask: Comma-separated field paths for "update" (default "text").
+            Supported: text, attachment, quoted_message_metadata (the last only
+            removes the quoted message).
+        force: For "delete", also delete the message's threaded replies. Without
+            it, deleting a message that has replies fails.
+
+    Returns:
+        str: Result of the requested action.
+    """
+    action = _require_action(action, ("get", "update", "delete"))
+    logger.info(
+        f"[manage_chat_message] Email: '{user_google_email}', Action: '{action}', Message: '{message_name}'"
+    )
+    _deny_if_restricted(action)
+    name = _require_resource_name(
+        message_name, "message_name", action, _MESSAGE_NAME_RE, "spaces/X/messages/Y"
+    )
+
+    if action == "get":
+        return await _get_message(service, name)
+    if action == "update":
+        return await _update_message(service, name, text, update_mask)
+    return await _delete_message(service, name, force)
+
+
+@server.tool(
+    title="Manage Chat Reaction",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_write")
+@handle_http_errors("manage_chat_reaction", service_type="chat")
+async def manage_chat_reaction(
+    service,
+    user_google_email: str,
+    action: str,
+    message_name: Optional[str] = None,
+    reaction_name: Optional[str] = None,
+    emoji_unicode: Optional[str] = None,
+    user: Optional[str] = None,
+    page_size: int = 25,
+    page_token: Optional[str] = None,
+) -> str:
+    """
+    Lists the emoji reactions on a Google Chat message, or deletes one of yours.
+
+    Requires a Google Workspace account; the Chat API rejects consumer accounts.
+    Use create_reaction to add a reaction.
+
+    Args:
+        action: One of "list", "delete".
+        message_name: Message resource name (spaces/X/messages/Y). Required for "list".
+        reaction_name: Reaction resource name (spaces/X/messages/Y/reactions/Z), as
+            returned by "list" or create_reaction. Required for "delete".
+        emoji_unicode: For "list", only reactions with this emoji (e.g. 👍).
+        user: For "list", only reactions by this user (users/ID; an email alias
+            may not be accepted by the filter).
+        page_size: Reactions per page for "list" (default 25).
+        page_token: Continue a previous "list" from its nextPageToken.
+
+    Returns:
+        str: Result of the requested action.
+    """
+    action = _require_action(action, ("list", "delete"))
+    logger.info(
+        f"[manage_chat_reaction] Email: '{user_google_email}', Action: '{action}'"
+    )
+    _deny_if_restricted(action)
+
+    if action == "list":
+        name = _require_resource_name(
+            message_name,
+            "message_name",
+            action,
+            _MESSAGE_NAME_RE,
+            "spaces/X/messages/Y",
+        )
+        return await _list_reactions(
+            service,
+            name,
+            _none_if_blank(emoji_unicode),
+            _none_if_blank(user),
+            page_size,
+            _none_if_blank(page_token),
+        )
+    name = _require_resource_name(
+        reaction_name,
+        "reaction_name",
+        action,
+        _REACTION_NAME_RE,
+        "spaces/X/messages/Y/reactions/Z",
+    )
+    return await _delete_reaction(service, name)
+
+
+@server.tool(
+    title="Find Chat Direct Message",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", "chat_spaces_readonly")
+@handle_http_errors("find_chat_direct_message", is_read_only=True, service_type="chat")
+async def find_chat_direct_message(
+    service,
+    user_google_email: str,
+    user: str,
+) -> str:
+    """
+    Finds the existing direct message space between you and another user.
+
+    Requires a Google Workspace account; the Chat API rejects consumer accounts.
+    Reports the DM's space ID when one exists, or that none exists yet.
+
+    Args:
+        user: The other person's email address or users/ID.
+
+    Returns:
+        str: The DM space ID and whether it exists.
+    """
+    who = _require_arg(user, "user", "find")
+    logger.info(
+        f"[find_chat_direct_message] Email: '{user_google_email}', User: '{who}'"
+    )
+    return await _find_direct_message(service, who)
+
+
+@server.tool(
+    title="Manage Chat Space",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("chat", ["chat_spaces", "chat_delete"])
+@handle_http_errors("manage_chat_space", service_type="chat")
+async def manage_chat_space(
+    service,
+    user_google_email: str,
+    action: str,
+    space_id: Optional[str] = None,
+    display_name: Optional[str] = None,
+    description: Optional[str] = None,
+    guidelines: Optional[str] = None,
+    space_type: Optional[str] = None,
+    external_user_allowed: Optional[bool] = None,
+    history_state: Optional[str] = None,
+    members: Optional[List[str]] = None,
+    query: Optional[str] = None,
+    page_size: int = 100,
+) -> str:
+    """
+    Creates, sets up, updates, deletes, or searches Google Chat spaces.
+
+    Requires a Google Workspace account; the Chat API rejects consumer accounts.
+
+    Args:
+        action: One of "create", "setup", "update", "delete", "search".
+        space_id: Space resource name (spaces/X). Required for "update" and "delete".
+        display_name: Space name (up to 128 chars). Required to create/set up a
+            SPACE; not allowed for GROUP_CHAT or DIRECT_MESSAGE. Updatable.
+        description: What the space is for (up to 4,096 chars). For create/setup/update.
+        guidelines: Space rules and etiquette (up to 5,000 chars). For create/setup/update.
+        space_type: "SPACE" (default) or "GROUP_CHAT" for "create"/"setup";
+            "setup" also accepts "DIRECT_MESSAGE" with exactly one member.
+            Optionally narrows "search". GROUP_CHAT spaces can only be made via
+            "setup" with members.
+        external_user_allowed: For create/setup, whether people outside your
+            organization may join. Immutable afterwards.
+        history_state: For "update", "HISTORY_ON" or "HISTORY_OFF".
+        members: For "setup", up to 49 people (emails or users/ID) to add
+            alongside you. Omit yourself.
+        query: For "search", case-insensitive text matched against display names
+            of spaces you have joined (spaces.search is admin-only, so this walks
+            spaces.list instead).
+        page_size: For "search", spaces fetched per page (default 100).
+
+    Returns:
+        str: Result of the requested action.
+    """
+    action = _require_action(action, ("create", "setup", "update", "delete", "search"))
+    logger.info(
+        f"[manage_chat_space] Email: '{user_google_email}', Action: '{action}', Space: '{space_id}'"
+    )
+    _deny_if_restricted(action)
+
+    display_name = _none_if_blank(display_name)
+    description = _none_if_null_sentinel(description)
+    guidelines = _none_if_null_sentinel(guidelines)
+
+    if action == "create":
+        kind = _require_choice(space_type, "space_type", _CREATE_SPACE_TYPES, "SPACE")
+        return await _create_space(
+            service, kind, display_name, description, guidelines, external_user_allowed
+        )
+    if action == "setup":
+        kind = _require_choice(space_type, "space_type", _SETUP_SPACE_TYPES, "SPACE")
+        return await _setup_space(
+            service,
+            kind,
+            display_name,
+            description,
+            guidelines,
+            external_user_allowed,
+            members,
+        )
+    if action == "search":
+        kind = _require_choice(space_type, "space_type", _SETUP_SPACE_TYPES)
+        return await _search_spaces(
+            service, _require_arg(query, "query", action), kind, page_size
+        )
+
+    space = _require_resource_name(
+        space_id, "space_id", action, _SPACE_NAME_RE, "spaces/X"
+    )
+    if action == "update":
+        state = _require_choice(history_state, "history_state", _HISTORY_STATES)
+        return await _update_space(
+            service, space, display_name, description, guidelines, state
+        )
+    return await _delete_space(service, space)
