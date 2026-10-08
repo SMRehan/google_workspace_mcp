@@ -83,6 +83,8 @@ docs:
     - get_doc_as_markdown
     - list_document_comments
     - manage_document_comment
+    - manage_doc_comments
+    - manage_doc_suggestions
   complete:
     - insert_doc_image
     - update_doc_headers_footers

@@ -6,6 +6,8 @@ to simplify the implementation of document editing tools.
 """
 
 import logging
+import re
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger(__name__)
@@ -105,6 +107,55 @@ VALID_BULLET_PRESETS = (
     "NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL",
     "NUMBERED_ZERODECIMAL_ALPHA_ROMAN",
 )
+
+VALID_WRITE_MODES = (
+    "EDIT",
+    "SUGGEST",
+)
+
+VALID_DATE_FORMATS = (
+    "DATE_FORMAT_MONTH_DAY_ABBREVIATED",
+    "DATE_FORMAT_MONTH_DAY_FULL",
+    "DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED",
+    "DATE_FORMAT_ISO8601",
+)
+
+VALID_IMAGE_REPLACE_METHODS = ("CENTER_CROP",)
+
+# Docs API constraints on caller-supplied dropdown IDs.
+DROPDOWN_DEFINITION_ID_PATTERN = re.compile(r"^kix\.[a-zA-Z0-9_-]{2,14}$")
+DROPDOWN_OPTION_ID_PATTERN = re.compile(r"^dropdownItem\.[a-zA-Z0-9_-]{2,14}$")
+DROPDOWN_MIN_OPTIONS = 2
+DROPDOWN_MAX_OPTIONS = 50
+
+
+def validate_write_mode(write_mode: str) -> str:
+    """Return the normalized write mode, raising ValueError when it is unsupported."""
+    if not isinstance(write_mode, str):
+        raise ValueError(
+            f"write_mode must be one of {', '.join(VALID_WRITE_MODES)}, got {write_mode!r}"
+        )
+    normalized = write_mode.strip().upper()
+    if normalized not in VALID_WRITE_MODES:
+        raise ValueError(
+            f"write_mode must be one of {', '.join(VALID_WRITE_MODES)}, got '{write_mode}'"
+        )
+    return normalized
+
+
+def build_batch_update_body(
+    requests: List[Dict[str, Any]], write_mode: str = "EDIT"
+) -> Dict[str, Any]:
+    """
+    Build the documents.batchUpdate body for a list of requests.
+
+    writeControl is only attached for SUGGEST so an EDIT body is byte-for-byte
+    what the tools sent before write modes existed.
+    """
+    body: Dict[str, Any] = {"requests": requests}
+    if validate_write_mode(write_mode) == "SUGGEST":
+        body["writeControl"] = {"writeMode": "SUGGEST"}
+    return body
 
 
 def validate_suggestions_view_mode(suggestions_view_mode: str) -> Optional[str]:
@@ -1856,6 +1907,506 @@ def create_pin_table_header_rows_request(
     }
 
 
+def create_insert_person_request(
+    index: Optional[int],
+    email: str,
+    name: Optional[str] = None,
+    tab_id: Optional[str] = None,
+    segment_id: Optional[str] = None,
+    end_of_segment: bool = False,
+) -> Dict[str, Any]:
+    """
+    Create an insertPerson request (a person smart chip).
+
+    Args:
+        index: Position to insert the chip; must fall inside an existing paragraph.
+        email: Email address linked to the person chip.
+        name: Optional display name shown instead of the email address.
+        tab_id: Optional ID of the tab to target.
+        segment_id: Optional header/footer/footnote segment ID.
+        end_of_segment: Append to the end of the segment instead of using index.
+
+    Reference:
+        https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#InsertPersonRequest
+    """
+    if not email or not isinstance(email, str) or "@" not in email:
+        raise ValueError("email must be a valid email address")
+
+    person_properties: Dict[str, Any] = {"email": email}
+    if name:
+        person_properties["name"] = name
+
+    request: Dict[str, Any] = {"insertPerson": {"personProperties": person_properties}}
+    request["insertPerson"].update(
+        _build_location(
+            index=index,
+            tab_id=tab_id,
+            segment_id=segment_id,
+            end_of_segment=end_of_segment,
+        )
+    )
+    return request
+
+
+def iso_date_to_rfc3339(date: str) -> str:
+    """
+    Convert an ISO 8601 date or datetime into the RFC 3339 UTC form the Docs API wants.
+
+    A bare date ("2026-10-08") becomes midnight UTC. A naive datetime is treated
+    as UTC; an offset-aware one is converted to UTC.
+    """
+    if not isinstance(date, str) or not date.strip():
+        raise ValueError("date must be an ISO 8601 date such as '2026-10-08'")
+    raw = date.strip()
+    if raw.endswith("Z") or raw.endswith("z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        raise ValueError(
+            f"date must be an ISO 8601 date or datetime, got '{date}'"
+        ) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def create_insert_date_request(
+    index: Optional[int],
+    date: str,
+    date_format: Optional[str] = None,
+    time_format: Optional[str] = None,
+    time_zone_id: Optional[str] = None,
+    locale: Optional[str] = None,
+    tab_id: Optional[str] = None,
+    segment_id: Optional[str] = None,
+    end_of_segment: bool = False,
+) -> Dict[str, Any]:
+    """
+    Create an insertDate request (a date smart chip).
+
+    Args:
+        index: Position to insert the chip; must fall inside an existing paragraph.
+        date: ISO 8601 date or datetime to represent.
+        date_format: One of VALID_DATE_FORMATS; the API default is
+            DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED.
+        time_format: TIME_FORMAT_DISABLED (default), TIME_FORMAT_HOUR_MINUTE or
+            TIME_FORMAT_HOUR_MINUTE_TIMEZONE.
+        time_zone_id: CLDR time zone such as "America/New_York".
+        locale: Language code such as "en".
+        tab_id: Optional ID of the tab to target.
+        segment_id: Optional header/footer segment ID.
+        end_of_segment: Append to the end of the segment instead of using index.
+
+    Reference:
+        https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#InsertDateRequest
+    """
+    properties: Dict[str, Any] = {"timestamp": iso_date_to_rfc3339(date)}
+    if date_format is not None:
+        normalized = str(date_format).strip().upper()
+        if normalized not in VALID_DATE_FORMATS:
+            raise ValueError(
+                f"date_format must be one of: {', '.join(VALID_DATE_FORMATS)}"
+            )
+        properties["dateFormat"] = normalized
+    if time_format is not None:
+        properties["timeFormat"] = str(time_format).strip().upper()
+    if time_zone_id:
+        properties["timeZoneId"] = time_zone_id
+    if locale:
+        properties["locale"] = locale
+
+    request: Dict[str, Any] = {"insertDate": {"dateElementProperties": properties}}
+    request["insertDate"].update(
+        _build_location(
+            index=index,
+            tab_id=tab_id,
+            segment_id=segment_id,
+            end_of_segment=end_of_segment,
+        )
+    )
+    return request
+
+
+def create_insert_rich_link_request(
+    index: Optional[int],
+    uri: str,
+    title: Optional[str] = None,
+    tab_id: Optional[str] = None,
+    segment_id: Optional[str] = None,
+    end_of_segment: bool = False,
+) -> Dict[str, Any]:
+    """
+    Create an insertRichLink request (a smart chip for a Google resource URL).
+
+    Args:
+        index: Position to insert the chip; must fall inside an existing paragraph.
+        uri: URL of the Drive file, YouTube video or Calendar event to link.
+        title: Optional link title; the API fills it from the resource when omitted.
+        tab_id: Optional ID of the tab to target.
+        segment_id: Optional header/footer/footnote segment ID.
+        end_of_segment: Append to the end of the segment instead of using index.
+
+    Reference:
+        https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#InsertRichLinkRequest
+    """
+    if (
+        not uri
+        or not isinstance(uri, str)
+        or not uri.startswith(("http://", "https://"))
+    ):
+        raise ValueError("uri must be an http(s) URL")
+
+    rich_link_properties: Dict[str, Any] = {"uri": uri}
+    if title:
+        rich_link_properties["title"] = title
+
+    request: Dict[str, Any] = {
+        "insertRichLink": {"richLinkProperties": rich_link_properties}
+    }
+    request["insertRichLink"].update(
+        _build_location(
+            index=index,
+            tab_id=tab_id,
+            segment_id=segment_id,
+            end_of_segment=end_of_segment,
+        )
+    )
+    return request
+
+
+def create_create_footnote_request(
+    index: Optional[int],
+    tab_id: Optional[str] = None,
+    end_of_segment: bool = False,
+) -> Dict[str, Any]:
+    """
+    Create a createFootnote request.
+
+    Footnote references can only live in the document body, so no segment ID is
+    accepted. The reply carries the new footnoteId, which is the segment ID for
+    writing the footnote's own text.
+
+    Reference:
+        https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#CreateFootnoteRequest
+    """
+    request: Dict[str, Any] = {"createFootnote": {}}
+    request["createFootnote"].update(
+        _build_location(index=index, tab_id=tab_id, end_of_segment=end_of_segment)
+    )
+    return request
+
+
+def _normalize_dropdown_options(options: List[Any]) -> List[Dict[str, Any]]:
+    """Accept plain strings or {display_value, option_id} dicts as dropdown options."""
+    if not isinstance(options, list):
+        raise ValueError("options must be a list")
+    if not DROPDOWN_MIN_OPTIONS <= len(options) <= DROPDOWN_MAX_OPTIONS:
+        raise ValueError(
+            f"options must contain between {DROPDOWN_MIN_OPTIONS} and "
+            f"{DROPDOWN_MAX_OPTIONS} entries, got {len(options)}"
+        )
+
+    normalized: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for option in options:
+        if isinstance(option, str):
+            display_value, option_id = option, None
+        elif isinstance(option, dict):
+            display_value = option.get("display_value")
+            option_id = option.get("option_id")
+        else:
+            raise ValueError(
+                "each option must be a string or an object with display_value"
+            )
+        if not display_value or not isinstance(display_value, str):
+            raise ValueError("each option needs a non-empty display_value")
+        entry: Dict[str, Any] = {"displayValue": display_value}
+        if option_id is not None:
+            if not DROPDOWN_OPTION_ID_PATTERN.match(str(option_id)):
+                raise ValueError(
+                    f"option_id '{option_id}' must match "
+                    f"{DROPDOWN_OPTION_ID_PATTERN.pattern}"
+                )
+            if option_id in seen_ids:
+                raise ValueError(f"option_id '{option_id}' is duplicated")
+            seen_ids.add(option_id)
+            entry["optionId"] = option_id
+        normalized.append(entry)
+    return normalized
+
+
+def create_dropdown_definition_request(
+    options: List[Any],
+    dropdown_definition_id: Optional[str] = None,
+    title: Optional[str] = None,
+    tab_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Create a createDropdownDefinition request.
+
+    Args:
+        options: 2-50 options, each a display string or
+            {"display_value": str, "option_id": optional str}.
+        dropdown_definition_id: Optional caller-chosen ID matching
+            ^kix.[a-zA-Z0-9_-]{2,14}$ (a literal dot after kix); the API generates one when omitted.
+        title: Optional title of the definition.
+        tab_id: Optional ID of the tab to create the definition in.
+
+    Reference:
+        https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#CreateDropdownDefinitionRequest
+    """
+    properties: Dict[str, Any] = {"options": _normalize_dropdown_options(options)}
+    if title:
+        properties["title"] = title
+
+    definition: Dict[str, Any] = {"dropdownDefinitionProperties": properties}
+    if dropdown_definition_id is not None:
+        if not DROPDOWN_DEFINITION_ID_PATTERN.match(str(dropdown_definition_id)):
+            raise ValueError(
+                f"dropdown_definition_id '{dropdown_definition_id}' must match "
+                f"{DROPDOWN_DEFINITION_ID_PATTERN.pattern}"
+            )
+        definition["dropdownDefinitionId"] = dropdown_definition_id
+
+    request: Dict[str, Any] = {"dropdownDefinition": definition}
+    if tab_id:
+        request["tabId"] = tab_id
+    return {"createDropdownDefinition": request}
+
+
+def create_insert_dropdown_request(
+    index: Optional[int],
+    dropdown_definition_id: str,
+    selected_option_id: Optional[str] = None,
+    tab_id: Optional[str] = None,
+    segment_id: Optional[str] = None,
+    end_of_segment: bool = False,
+) -> Dict[str, Any]:
+    """
+    Create an insertDropdown request for an existing dropdown definition.
+
+    Reference:
+        https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#InsertDropdownRequest
+    """
+    if not dropdown_definition_id or not isinstance(dropdown_definition_id, str):
+        raise ValueError("dropdown_definition_id is required")
+
+    request: Dict[str, Any] = {
+        "insertDropdown": {"dropdownDefinitionId": dropdown_definition_id}
+    }
+    if selected_option_id:
+        request["insertDropdown"]["selectedOptionId"] = selected_option_id
+    request["insertDropdown"].update(
+        _build_location(
+            index=index,
+            tab_id=tab_id,
+            segment_id=segment_id,
+            end_of_segment=end_of_segment,
+        )
+    )
+    return request
+
+
+def create_replace_image_request(
+    image_object_id: str,
+    uri: str,
+    image_replace_method: Optional[str] = None,
+    tab_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Create a replaceImage request that swaps an existing image for one at uri.
+
+    Reference:
+        https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#ReplaceImageRequest
+    """
+    if not image_object_id or not isinstance(image_object_id, str):
+        raise ValueError("image_object_id is required")
+    if (
+        not uri
+        or not isinstance(uri, str)
+        or not uri.startswith(("http://", "https://"))
+    ):
+        raise ValueError("uri must be an http(s) URL")
+
+    request: Dict[str, Any] = {"imageObjectId": image_object_id, "uri": uri}
+    if image_replace_method is not None:
+        normalized = str(image_replace_method).strip().upper()
+        if normalized not in VALID_IMAGE_REPLACE_METHODS:
+            raise ValueError(
+                "image_replace_method must be one of: "
+                f"{', '.join(VALID_IMAGE_REPLACE_METHODS)}"
+            )
+        request["imageReplaceMethod"] = normalized
+    if tab_id:
+        request["tabId"] = tab_id
+    return {"replaceImage": request}
+
+
+def create_delete_header_request(
+    header_id: str, tab_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Create a deleteHeader request for the header with the given ID."""
+    if not header_id or not isinstance(header_id, str):
+        raise ValueError("header_id is required")
+    request: Dict[str, Any] = {"headerId": header_id}
+    if tab_id:
+        request["tabId"] = tab_id
+    return {"deleteHeader": request}
+
+
+def create_delete_footer_request(
+    footer_id: str, tab_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Create a deleteFooter request for the footer with the given ID."""
+    if not footer_id or not isinstance(footer_id, str):
+        raise ValueError("footer_id is required")
+    request: Dict[str, Any] = {"footerId": footer_id}
+    if tab_id:
+        request["tabId"] = tab_id
+    return {"deleteFooter": request}
+
+
+def create_delete_positioned_object_request(
+    object_id: str, tab_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Create a deletePositionedObject request (floating images and drawings)."""
+    if not object_id or not isinstance(object_id, str):
+        raise ValueError("object_id is required")
+    request: Dict[str, Any] = {"objectId": object_id}
+    if tab_id:
+        request["tabId"] = tab_id
+    return {"deletePositionedObject": request}
+
+
+def create_update_named_style_request(
+    named_style_type: str,
+    tab_id: Optional[str] = None,
+    bold: Optional[bool] = None,
+    italic: Optional[bool] = None,
+    underline: Optional[bool] = None,
+    strikethrough: Optional[bool] = None,
+    font_size: Optional[float] = None,
+    font_family: Optional[str] = None,
+    font_weight: Optional[int] = None,
+    text_color: Optional[str] = None,
+    background_color: Optional[str] = None,
+    baseline_offset: Optional[str] = None,
+    small_caps: Optional[bool] = None,
+    alignment: Optional[str] = None,
+    line_spacing: Optional[float] = None,
+    indent_first_line: Optional[float] = None,
+    indent_start: Optional[float] = None,
+    indent_end: Optional[float] = None,
+    space_above: Optional[float] = None,
+    space_below: Optional[float] = None,
+    direction: Optional[str] = None,
+    keep_lines_together: Optional[bool] = None,
+    keep_with_next: Optional[bool] = None,
+    avoid_widow_and_orphan: Optional[bool] = None,
+    page_break_before: Optional[bool] = None,
+    spacing_mode: Optional[str] = None,
+    shading_color: Optional[str] = None,
+    border_edges: Optional[List[str]] = None,
+    border_color: Optional[str] = None,
+    border_width: Optional[float] = None,
+    border_padding: Optional[float] = None,
+    border_dash: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Create an updateNamedStyle request that restyles every paragraph using a named style.
+
+    Changing NORMAL_TEXT or HEADING_2 here restyles the whole document at once,
+    unlike updateParagraphStyle/updateTextStyle which touch one range.
+
+    Returns:
+        The request, or None when no text or paragraph style field was given.
+
+    Reference:
+        https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#UpdateNamedStyleRequest
+    """
+    if not isinstance(named_style_type, str):
+        raise ValueError(
+            f"named_style_type must be one of: {', '.join(VALID_NAMED_STYLE_TYPES)}"
+        )
+    style_type = named_style_type.strip().upper()
+    if style_type not in VALID_NAMED_STYLE_TYPES:
+        raise ValueError(
+            f"named_style_type must be one of: {', '.join(VALID_NAMED_STYLE_TYPES)}"
+        )
+
+    text_style, text_fields = build_text_style(
+        bold=bold,
+        italic=italic,
+        underline=underline,
+        strikethrough=strikethrough,
+        font_size=font_size,
+        font_family=font_family,
+        font_weight=font_weight,
+        text_color=text_color,
+        background_color=background_color,
+        baseline_offset=baseline_offset,
+        small_caps=small_caps,
+    )
+    paragraph_style, paragraph_fields = build_paragraph_style(
+        alignment=alignment,
+        line_spacing=line_spacing,
+        indent_first_line=indent_first_line,
+        indent_start=indent_start,
+        indent_end=indent_end,
+        space_above=space_above,
+        space_below=space_below,
+        direction=direction,
+        keep_lines_together=keep_lines_together,
+        keep_with_next=keep_with_next,
+        avoid_widow_and_orphan=avoid_widow_and_orphan,
+        page_break_before=page_break_before,
+        spacing_mode=spacing_mode,
+        shading_color=shading_color,
+        border_edges=border_edges,
+        border_color=border_color,
+        border_width=border_width,
+        border_padding=border_padding,
+        border_dash=border_dash,
+    )
+
+    if not text_fields and not paragraph_fields:
+        return None
+
+    named_style: Dict[str, Any] = {"namedStyleType": style_type}
+    fields = ["namedStyleType"]
+    if text_fields:
+        named_style["textStyle"] = text_style
+        fields.extend(f"textStyle.{field}" for field in text_fields)
+    if paragraph_fields:
+        named_style["paragraphStyle"] = paragraph_style
+        fields.extend(f"paragraphStyle.{field}" for field in paragraph_fields)
+
+    request: Dict[str, Any] = {"namedStyle": named_style, "fields": ",".join(fields)}
+    if tab_id:
+        request["tabId"] = tab_id
+    return {"updateNamedStyle": request}
+
+
+# Operation types that take one insertion location (index, end_of_segment or a
+# semantic anchor). Shared by validate_operation and the batch manager so the
+# anchor-capable set cannot drift between them.
+INSERTION_OPERATION_TYPES = frozenset(
+    {
+        "insert_text",
+        "insert_table",
+        "insert_page_break",
+        "insert_section_break",
+        "insert_image",
+        "insert_person",
+        "insert_date",
+        "insert_rich_link",
+        "create_footnote",
+        "insert_dropdown",
+    }
+)
+
+
 def validate_operation(operation: Dict[str, Any]) -> tuple[bool, str]:
     """
     Validate a batch operation dictionary.
@@ -1914,6 +2465,17 @@ def validate_operation(operation: Dict[str, Any]) -> tuple[bool, str]:
         "update_table_column_properties": ["table_start_index", "column_indices"],
         "update_table_row_style": ["table_start_index", "row_indices"],
         "pin_table_header_rows": ["table_start_index", "pinned_header_rows_count"],
+        "insert_person": ["email"],
+        "insert_date": ["date"],
+        "insert_rich_link": ["uri"],
+        "create_footnote": [],
+        "create_dropdown_definition": ["options"],
+        "insert_dropdown": ["dropdown_definition_id"],
+        "replace_image": ["image_object_id", "uri"],
+        "delete_header": ["header_id"],
+        "delete_footer": ["footer_id"],
+        "update_named_style": ["named_style_type"],
+        "delete_positioned_object": ["object_id"],
     }
 
     if op_type not in required_fields:
@@ -1923,13 +2485,7 @@ def validate_operation(operation: Dict[str, Any]) -> tuple[bool, str]:
         if field not in operation:
             return False, f"Missing required field: {field}"
 
-    if op_type in {
-        "insert_text",
-        "insert_table",
-        "insert_page_break",
-        "insert_section_break",
-        "insert_image",
-    }:
+    if op_type in INSERTION_OPERATION_TYPES:
         provided = sum(
             [operation.get("index") is not None, bool(operation.get("end_of_segment"))]
             + [

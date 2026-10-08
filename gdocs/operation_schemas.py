@@ -15,6 +15,28 @@ from pydantic import BaseModel, ConfigDict, Field, BeforeValidator, model_valida
 
 ParagraphBorderEdge = Literal["top", "bottom", "left", "right", "between"]
 TableBorderEdge = Literal["top", "bottom", "left", "right"]
+NamedStyleType = Literal[
+    "NORMAL_TEXT",
+    "TITLE",
+    "SUBTITLE",
+    "HEADING_1",
+    "HEADING_2",
+    "HEADING_3",
+    "HEADING_4",
+    "HEADING_5",
+    "HEADING_6",
+]
+DateFormat = Literal[
+    "DATE_FORMAT_MONTH_DAY_ABBREVIATED",
+    "DATE_FORMAT_MONTH_DAY_FULL",
+    "DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED",
+    "DATE_FORMAT_ISO8601",
+]
+TimeFormat = Literal[
+    "TIME_FORMAT_DISABLED",
+    "TIME_FORMAT_HOUR_MINUTE",
+    "TIME_FORMAT_HOUR_MINUTE_TIMEZONE",
+]
 
 
 def _coerce_json_str_to_list(v: Any) -> Any:
@@ -423,6 +445,180 @@ class UpdateDocTabOperation(BaseModel):
     title: str
 
 
+class InsertPersonOperation(InsertionLocationOperation, SegmentTargetDocOperation):
+    type: Literal["insert_person"]
+    email: str = Field(description="Email address the person chip links to.")
+    name: Optional[str] = Field(
+        default=None,
+        description="Display name shown in the chip instead of the email address.",
+    )
+
+
+class InsertDateOperation(InsertionLocationOperation, SegmentTargetDocOperation):
+    type: Literal["insert_date"]
+    date: str = Field(
+        description=(
+            "ISO 8601 date ('2026-10-08') or datetime ('2026-10-08T15:00:00Z'). "
+            "A bare date is midnight UTC; a naive datetime is treated as UTC."
+        )
+    )
+    date_format: Optional[DateFormat] = Field(
+        default=None,
+        description="Display format; the API default is DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED.",
+    )
+    time_format: Optional[TimeFormat] = Field(
+        default=None,
+        description="Time display; the API default is TIME_FORMAT_DISABLED.",
+    )
+    time_zone_id: Optional[str] = Field(
+        default=None,
+        description="CLDR time zone such as 'America/New_York' used to display the date.",
+    )
+    locale: Optional[str] = Field(
+        default=None, description="Language code such as 'en' for the display text."
+    )
+
+
+class InsertRichLinkOperation(InsertionLocationOperation, SegmentTargetDocOperation):
+    type: Literal["insert_rich_link"]
+    uri: str = Field(
+        description="URL of a Drive file, YouTube video or Calendar event to show as a smart chip."
+    )
+    title: Optional[str] = Field(
+        default=None,
+        description="Chip title; the API fills it from the linked resource when omitted.",
+    )
+
+
+class CreateFootnoteOperation(InsertionLocationOperation):
+    type: Literal["create_footnote"]
+    text: Optional[str] = Field(
+        default=None,
+        description=(
+            "Text to write into the new footnote. Sent as a follow-up request once "
+            "the footnote's segment ID is known."
+        ),
+    )
+
+
+class DropdownOptionSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_value: str = Field(description="Text shown for this option.")
+    option_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional ID matching ^dropdownItem\\.[a-zA-Z0-9_-]{2,14}$ so "
+            "insert_dropdown can preselect it; the API generates one when omitted."
+        ),
+    )
+
+
+class CreateDropdownDefinitionOperation(StrictDocOperation):
+    type: Literal["create_dropdown_definition"]
+    options: list[Union[str, DropdownOptionSpec]] = Field(
+        min_length=2,
+        max_length=50,
+        description="2-50 options, each a display string or {display_value, option_id}.",
+    )
+    dropdown_definition_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional ID matching ^kix\\.[a-zA-Z0-9_-]{2,14}$ so a later "
+            "insert_dropdown in the same batch can reference it; the API generates "
+            "one when omitted."
+        ),
+    )
+    title: Optional[str] = None
+
+
+class InsertDropdownOperation(InsertionLocationOperation, SegmentTargetDocOperation):
+    type: Literal["insert_dropdown"]
+    dropdown_definition_id: str = Field(
+        description="ID of an existing dropdown definition (from create_dropdown_definition or inspect_doc_structure)."
+    )
+    selected_option_id: Optional[str] = Field(
+        default=None,
+        description="Option to preselect; defaults to the definition's first option.",
+    )
+
+
+class ReplaceImageOperation(StrictDocOperation):
+    type: Literal["replace_image"]
+    image_object_id: str = Field(
+        description="ID of the existing inline or positioned image to replace."
+    )
+    uri: str = Field(description="URL of the new image (fetched once at replace time).")
+    image_replace_method: Optional[Literal["CENTER_CROP"]] = None
+
+
+class DeleteHeaderOperation(StrictDocOperation):
+    type: Literal["delete_header"]
+    header_id: str = Field(description="Header ID from inspect_doc_structure.")
+
+
+class DeleteFooterOperation(StrictDocOperation):
+    type: Literal["delete_footer"]
+    footer_id: str = Field(description="Footer ID from inspect_doc_structure.")
+
+
+class UpdateNamedStyleOperation(StrictDocOperation):
+    type: Literal["update_named_style"]
+    named_style_type: NamedStyleType = Field(
+        description="Named style whose definition changes document-wide."
+    )
+    bold: Optional[bool] = None
+    italic: Optional[bool] = None
+    underline: Optional[bool] = None
+    strikethrough: Optional[bool] = None
+    font_size: Optional[float] = None
+    font_family: Optional[str] = None
+    font_weight: Optional[int] = None
+    text_color: Optional[str] = None
+    background_color: Optional[str] = None
+    baseline_offset: Optional[str] = None
+    small_caps: Optional[bool] = None
+    alignment: Optional[str] = None
+    line_spacing: Optional[float] = None
+    indent_first_line: Optional[float] = None
+    indent_start: Optional[float] = None
+    indent_end: Optional[float] = None
+    space_above: Optional[float] = None
+    space_below: Optional[float] = None
+    direction: Optional[str] = None
+    keep_lines_together: Optional[bool] = None
+    keep_with_next: Optional[bool] = None
+    avoid_widow_and_orphan: Optional[bool] = None
+    page_break_before: Optional[bool] = None
+    spacing_mode: Optional[str] = None
+    shading_color: Optional[str] = None
+    border_edges: Optional[list[ParagraphBorderEdge]] = Field(
+        default=None,
+        min_length=1,
+        description="Paragraph border edges to update; omit to update top, bottom, left, and right.",
+    )
+    border_color: Optional[str] = None
+    border_width: Optional[float] = None
+    border_padding: Optional[float] = None
+    border_dash: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_has_style_field(self) -> "UpdateNamedStyleOperation":
+        style_fields = self.model_dump(exclude={"type", "tab_id", "named_style_type"})
+        if not any(value is not None for value in style_fields.values()):
+            raise ValueError(
+                "update_named_style needs at least one text or paragraph style field."
+            )
+        return self
+
+
+class DeletePositionedObjectOperation(StrictDocOperation):
+    type: Literal["delete_positioned_object"]
+    object_id: str = Field(
+        description="Positioned object ID from inspect_doc_structure (floating image or drawing)."
+    )
+
+
 BatchDocOperation = Annotated[
     Union[
         InsertTextOperation,
@@ -455,6 +651,17 @@ BatchDocOperation = Annotated[
         InsertDocTabOperation,
         DeleteDocTabOperation,
         UpdateDocTabOperation,
+        InsertPersonOperation,
+        InsertDateOperation,
+        InsertRichLinkOperation,
+        CreateFootnoteOperation,
+        CreateDropdownDefinitionOperation,
+        InsertDropdownOperation,
+        ReplaceImageOperation,
+        DeleteHeaderOperation,
+        DeleteFooterOperation,
+        UpdateNamedStyleOperation,
+        DeletePositionedObjectOperation,
     ],
     Field(discriminator="type"),
 ]

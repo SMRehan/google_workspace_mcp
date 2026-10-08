@@ -55,6 +55,28 @@ from gdocs.docs_helpers import (
     create_update_paragraph_style_request,
     extract_text_from_elements,
     process_tab_hierarchy,
+    build_batch_update_body,
+)
+from gdocs.docs_comments import (
+    COMMENT_ACTIONS,
+    CommentInputError,
+    create_add_comment_reply_request,
+    create_delete_comment_reply_request,
+    create_delete_comment_request,
+    create_insert_comment_request,
+    create_update_comment_post_request,
+    describe_comment_thread,
+    describe_post,
+    format_comment_list,
+    list_drive_comments,
+    resolve_comment_range,
+)
+from gdocs.docs_suggestions import (
+    SUGGESTION_ACTIONS,
+    collect_suggestions,
+    create_suggestion_action_request,
+    format_suggestions,
+    normalize_suggestion_ids,
 )
 
 # Import document structure and table utilities
@@ -631,6 +653,7 @@ async def modify_doc_text(
     clear_link: bool = None,
     baseline_offset: str = None,
     small_caps: bool = None,
+    write_mode: Literal["EDIT", "SUGGEST"] = "EDIT",
 ) -> str:
     """
     Modifies text in a Google Doc - can insert/replace text and/or apply formatting in a single operation.
@@ -667,6 +690,9 @@ async def modify_doc_text(
         clear_link: Remove hyperlink from the target range
         baseline_offset: One of NONE, SUPERSCRIPT, SUBSCRIPT
         small_caps: Whether to apply small caps
+        write_mode: "EDIT" (default) applies the change directly; "SUGGEST"
+            records it as a tracked suggestion that collaborators accept or
+            reject (sent as writeControl.writeMode).
 
     Returns:
         str: Confirmation message with operation details
@@ -868,7 +894,10 @@ async def modify_doc_text(
     try:
         await asyncio.to_thread(
             service.documents()
-            .batchUpdate(documentId=document_id, body={"requests": requests})
+            .batchUpdate(
+                documentId=document_id,
+                body=build_batch_update_body(requests, write_mode),
+            )
             .execute
         )
     except HttpError as error:
@@ -899,6 +928,7 @@ async def find_and_replace_doc(
     replace_text: str,
     match_case: bool = False,
     tab_id: Optional[str] = None,
+    write_mode: Literal["EDIT", "SUGGEST"] = "EDIT",
 ) -> str:
     """
     Finds and replaces text throughout a Google Doc. No index calculation required.
@@ -919,6 +949,9 @@ async def find_and_replace_doc(
         replace_text: Text to replace with
         match_case: Whether to match case exactly
         tab_id: Optional ID of the tab to target
+        write_mode: "EDIT" (default) applies the change directly; "SUGGEST"
+            records it as a tracked suggestion that collaborators accept or
+            reject (sent as writeControl.writeMode).
 
     Returns:
         str: Confirmation message with replacement count
@@ -934,7 +967,9 @@ async def find_and_replace_doc(
 
     result = await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(
+            documentId=document_id, body=build_batch_update_body(requests, write_mode)
+        )
         .execute
     )
 
@@ -970,6 +1005,7 @@ async def insert_doc_elements(
     columns: int = None,
     list_type: str = None,
     text: str = None,
+    write_mode: Literal["EDIT", "SUGGEST"] = "EDIT",
 ) -> str:
     """
     Inserts structural elements like tables, lists, or page breaks into a Google Doc.
@@ -983,6 +1019,9 @@ async def insert_doc_elements(
         columns: Number of columns for table (required for table)
         list_type: Type of list ("UNORDERED", "ORDERED") (required for list)
         text: Initial text content for list items
+        write_mode: "EDIT" (default) applies the change directly; "SUGGEST"
+            records it as a tracked suggestion that collaborators accept or
+            reject (sent as writeControl.writeMode).
 
     Returns:
         str: Confirmation message with insertion details
@@ -1031,7 +1070,9 @@ async def insert_doc_elements(
 
     await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(
+            documentId=document_id, body=build_batch_update_body(requests, write_mode)
+        )
         .execute
     )
 
@@ -1233,6 +1274,7 @@ async def batch_update_doc(
     user_google_email: str,
     document_id: str,
     operations: BatchDocOperations,
+    write_mode: Literal["EDIT", "SUGGEST"] = "EDIT",
 ) -> str:
     """
     Executes multiple low-level document operations in a single atomic batch update.
@@ -1310,6 +1352,10 @@ async def batch_update_doc(
         document_id: ID of the document to update
         operations: List of operation dicts. Each operation MUST have a 'type' field.
                     All operations accept an optional 'tab_id' to target a specific tab.
+        write_mode: "EDIT" (default) applies every operation directly. "SUGGEST"
+                    records the whole batch as tracked suggestions (Docs
+                    writeControl.writeMode) that collaborators can accept or
+                    reject with manage_doc_suggestions.
 
     Supported operation types and their parameters:
 
@@ -1430,6 +1476,50 @@ async def batch_update_doc(
                          optional: parent_tab_id (str)
       delete_doc_tab   - required: tab_id (str)
       update_doc_tab   - required: tab_id (str), title (str)
+      insert_person    - required: email (str)
+                         optional: name, index, end_of_segment, after_heading,
+                                   before_heading, anchor_text, tab_id, segment_id
+                         Inserts a person smart chip. Like insert_text, takes
+                         exactly one location (index, end_of_segment or anchor).
+      insert_date      - required: date (ISO 8601, e.g. "2026-10-08")
+                         optional: date_format (DATE_FORMAT_MONTH_DAY_ABBREVIATED|
+                                   DATE_FORMAT_MONTH_DAY_FULL|
+                                   DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED|
+                                   DATE_FORMAT_ISO8601), time_format, time_zone_id,
+                                   locale, plus one location as for insert_person
+      insert_rich_link - required: uri (Drive/YouTube/Calendar URL)
+                         optional: title, plus one location as for insert_person
+      create_footnote  - optional: text (written into the new footnote), plus one
+                                   body location (index, end_of_segment or anchor;
+                                   no segment_id). The reply reports the new
+                                   footnote_id, which is its segment_id.
+      create_dropdown_definition
+                       - required: options (2-50 strings or
+                                   {display_value, option_id} objects)
+                         optional: dropdown_definition_id (^kix.XXXX, so a later
+                                   insert_dropdown can use it), title, tab_id
+                         The reply reports the definition and option IDs.
+      insert_dropdown  - required: dropdown_definition_id (str)
+                         optional: selected_option_id, plus one location as for
+                                   insert_person
+      replace_image    - required: image_object_id (str), uri (str)
+                         optional: image_replace_method ('CENTER_CROP'), tab_id
+      delete_header    - required: header_id (str)      optional: tab_id
+      delete_footer    - required: footer_id (str)      optional: tab_id
+      update_named_style
+                       - required: named_style_type (NORMAL_TEXT|TITLE|SUBTITLE|
+                                   HEADING_1..HEADING_6) plus at least one of the
+                                   format_text style fields (bold, italic, underline,
+                                   strikethrough, font_size, font_family, font_weight,
+                                   text_color, background_color, baseline_offset,
+                                   small_caps) or update_paragraph_style fields
+                                   (alignment, line_spacing, indent_*, space_above,
+                                   space_below, direction, keep_*, spacing_mode,
+                                   shading_color, border_*)
+                         Redefines the named style document-wide: every paragraph
+                         using it changes, now and in future.
+      delete_positioned_object
+                       - required: object_id (str)      optional: tab_id
 
     Example - Safe document building (no index calculation needed):
         [
@@ -1462,6 +1552,21 @@ async def batch_update_doc(
             {"type": "update_document_style", "margin_top": 72, "margin_bottom": 72}
         ]
 
+    Example - Smart chips, footnotes and dropdowns (no index math):
+        [
+            {"type": "insert_person", "end_of_segment": true, "email": "ana@example.com"},
+            {"type": "insert_date", "anchor_text": "Due:", "date": "2026-11-01"},
+            {"type": "create_footnote", "anchor_text": "see note", "text": "Source: Q3 report."},
+            {"type": "create_dropdown_definition", "dropdown_definition_id": "kix.status",
+             "options": ["Draft", "Review", "Final"]},
+            {"type": "insert_dropdown", "end_of_segment": true,
+             "dropdown_definition_id": "kix.status"}
+        ]
+
+    Example - Propose edits as suggestions instead of applying them:
+        write_mode="SUGGEST" with
+        [{"type": "find_replace", "find_text": "Q3", "replace_text": "Q4"}]
+
     Returns:
         str: Confirmation message with batch results and document length for chaining
     """
@@ -1491,7 +1596,7 @@ async def batch_update_doc(
     batch_manager = BatchOperationManager(service)
 
     success, message, metadata = await batch_manager.execute_batch_operations(
-        document_id, normalized_operations
+        document_id, normalized_operations, write_mode=write_mode
     )
 
     if success:
@@ -1511,6 +1616,11 @@ async def batch_update_doc(
             parts.append(
                 f" Revision: {revision_before or 'unknown'} -> "
                 f"{revision_after or 'unknown'}."
+            )
+        if metadata.get("write_mode") == "SUGGEST":
+            parts.append(
+                " Changes were recorded as suggestions; use manage_doc_suggestions "
+                "to list, accept or reject them."
             )
 
         # Reporting what the edited range now looks like lets the caller confirm
@@ -2390,6 +2500,7 @@ async def update_paragraph_style(
     list_type: str = None,
     list_nesting_level: int = None,
     bullet_preset: str = None,
+    write_mode: Literal["EDIT", "SUGGEST"] = "EDIT",
 ) -> str:
     """
     Apply paragraph-level formatting, heading styles, and/or list formatting to a range in a Google Doc.
@@ -2436,6 +2547,9 @@ async def update_paragraph_style(
         list_nesting_level: Nesting level for lists (0-8, where 0 is top level, default is 0)
                            Use higher levels for nested/indented list items
         bullet_preset: Optional explicit Google Docs bullet preset
+        write_mode: "EDIT" (default) applies the change directly; "SUGGEST"
+            records it as a tracked suggestion that collaborators accept or
+            reject (sent as writeControl.writeMode).
 
     Returns:
         str: Confirmation message with formatting details
@@ -2621,7 +2735,9 @@ async def update_paragraph_style(
 
     await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(
+            documentId=document_id, body=build_batch_update_body(requests, write_mode)
+        )
         .execute
     )
 
@@ -3107,6 +3223,270 @@ async def manage_doc_tab(
         "tab_id": tab_id,
         "link": link,
     }
+
+
+@server.tool(
+    title="Manage Doc Comments",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("manage_doc_comments", service_type="docs")
+@require_multiple_services(
+    [
+        {"service_type": "docs", "scopes": "docs_write", "param_name": "docs_service"},
+        {
+            "service_type": "drive",
+            "scopes": "drive_read",
+            "param_name": "drive_service",
+        },
+    ]
+)
+async def manage_doc_comments(
+    docs_service: Any,
+    drive_service: Any,
+    user_google_email: str,
+    document_id: str,
+    action: Literal[
+        "list",
+        "create",
+        "reply",
+        "resolve",
+        "reopen",
+        "update",
+        "delete",
+        "delete_reply",
+    ],
+    content: Optional[str] = None,
+    comment_id: Optional[str] = None,
+    post_id: Optional[str] = None,
+    start_index: Optional[int] = None,
+    end_index: Optional[int] = None,
+    anchor_text: Optional[str] = None,
+    assignee_email: Optional[str] = None,
+    resolve: bool = False,
+    tab_id: Optional[str] = None,
+    segment_id: Optional[str] = None,
+    include_resolved: bool = True,
+) -> str:
+    """
+    Create, reply to, resolve, edit, delete and list comment threads anchored to document text.
+
+    Unlike manage_document_comment (Drive API, file-level comments), this uses the
+    Docs API so a new comment is anchored to an exact range, by index or by the
+    literal text it should highlight, and threads can be resolved, reopened,
+    edited and deleted.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the document
+        action: One of:
+            - "list": every thread with comment_id, post_ids, status, assignee,
+              anchor and replies (read through the Drive comments API)
+            - "create": new thread on a range; needs content and either
+              start_index+end_index or anchor_text
+            - "reply": add a reply (comment_id, content; optional assignee_email;
+              resolve=true also resolves the thread)
+            - "resolve" / "reopen": change thread status (comment_id; optional content)
+            - "update": edit the head post or a reply (comment_id, post_id, content)
+            - "delete": remove the whole thread (comment_id)
+            - "delete_reply": remove one reply (comment_id, post_id)
+        content: Comment text (plain text, max 2048 bytes)
+        comment_id: Thread ID from create/list output
+        post_id: Post ID of the head post or a reply (from create/list output)
+        start_index: Start of the commented range (Docs index, inclusive)
+        end_index: End of the commented range (exclusive)
+        anchor_text: Literal text to comment on instead of indices; it must occur
+            exactly once within one paragraph of the targeted tab/segment
+        assignee_email: Assign the thread to this person (create or reply)
+        resolve: With action="reply", also resolve the thread
+        tab_id: Optional tab containing the range (create)
+        segment_id: Optional header/footer/footnote segment containing the range (create)
+        include_resolved: With action="list", include resolved threads (default true)
+
+    Returns:
+        str: Human-readable result including the IDs needed for follow-up actions
+    """
+    logger.info(
+        f"[manage_doc_comments] action={action}, doc={document_id}, comment_id={comment_id}"
+    )
+    if action not in COMMENT_ACTIONS:
+        raise UserInputError(
+            f"Invalid action '{action}'. Must be one of: {', '.join(COMMENT_ACTIONS)}."
+        )
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+
+    if action == "list":
+        comments = await list_drive_comments(drive_service, document_id)
+        return format_comment_list(comments, document_id, include_resolved)
+
+    try:
+        if action == "create":
+            has_indices = start_index is not None or end_index is not None
+            if has_indices and anchor_text is not None:
+                raise CommentInputError(
+                    "Provide either start_index and end_index or anchor_text, not both."
+                )
+            if anchor_text is not None:
+                doc = await asyncio.to_thread(
+                    docs_service.documents()
+                    .get(documentId=document_id, includeTabsContent=True)
+                    .execute
+                )
+                start_index, end_index = resolve_comment_range(
+                    doc, anchor_text, tab_id, segment_id
+                )
+            elif start_index is None or end_index is None:
+                raise CommentInputError(
+                    "The 'create' action needs start_index and end_index, or anchor_text."
+                )
+            request = create_insert_comment_request(
+                start_index,
+                end_index,
+                content,
+                assignee_email=assignee_email,
+                tab_id=tab_id,
+                segment_id=segment_id,
+            )
+        elif action == "reply":
+            request = create_add_comment_reply_request(
+                comment_id,
+                content=content,
+                assignee_email=assignee_email,
+                comment_action="RESOLVE" if resolve else None,
+            )
+        elif action in ("resolve", "reopen"):
+            request = create_add_comment_reply_request(
+                comment_id,
+                content=content,
+                assignee_email=assignee_email,
+                comment_action=action.upper(),
+            )
+        elif action == "update":
+            request = create_update_comment_post_request(comment_id, post_id, content)
+        elif action == "delete":
+            request = create_delete_comment_request(comment_id)
+        else:  # delete_reply
+            request = create_delete_comment_reply_request(comment_id, post_id)
+    except CommentInputError as e:
+        raise UserInputError(str(e)) from e
+
+    result = await asyncio.to_thread(
+        docs_service.documents()
+        .batchUpdate(documentId=document_id, body={"requests": [request]})
+        .execute
+    )
+    reply = (result.get("replies") or [{}])[0]
+
+    if action == "create":
+        thread = reply.get("insertComment", {}).get("commentThread", {})
+        return (
+            f"Created comment on range {start_index}-{end_index} in document "
+            f"{document_id}: {describe_comment_thread(thread)}. Link: {link}"
+        )
+    if action in ("reply", "resolve", "reopen"):
+        post = reply.get("addCommentReply", {}).get("post", {})
+        verb = {
+            "reply": "Replied to",
+            "resolve": "Resolved",
+            "reopen": "Reopened",
+        }[action]
+        note = " and resolved it" if action == "reply" and resolve else ""
+        return (
+            f"{verb} comment thread {comment_id}{note} in document {document_id} "
+            f"({describe_post(post)}). Link: {link}"
+        )
+    if action == "update":
+        return f"Updated post {post_id} in comment thread {comment_id} of document {document_id}. Link: {link}"
+    if action == "delete":
+        return f"Deleted comment thread {comment_id} from document {document_id}. Link: {link}"
+    return f"Deleted reply {post_id} from comment thread {comment_id} in document {document_id}. Link: {link}"
+
+
+@server.tool(
+    title="Manage Doc Suggestions",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("manage_doc_suggestions", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def manage_doc_suggestions(
+    service: Any,
+    user_google_email: str,
+    document_id: str,
+    action: Literal["list", "accept", "reject", "delete"],
+    suggestion_ids: Optional[List[str]] = None,
+    tab_id: Optional[str] = None,
+) -> str:
+    """
+    List, accept, reject or delete tracked suggestions ("Suggesting" mode edits) in a Google Doc.
+
+    Suggestions are created by collaborators in Suggesting mode or by any write
+    tool here called with write_mode="SUGGEST". "list" walks the document with
+    suggestionsViewMode=SUGGESTIONS_INLINE and reports each suggestion ID with
+    its kind (insertion, deletion, text_style, paragraph_style, ...) and a text
+    snippet; the other actions apply to one or many suggestion_ids in a single
+    batch.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the document
+        action: "list", "accept", "reject" or "delete"
+        suggestion_ids: Suggestion IDs to act on (required for accept, reject, delete)
+        tab_id: With action="list", only report suggestions in this tab
+
+    Returns:
+        str: Suggestion listing, or confirmation of the IDs acted on
+    """
+    logger.info(
+        f"[manage_doc_suggestions] action={action}, doc={document_id}, ids={suggestion_ids}"
+    )
+    if action not in SUGGESTION_ACTIONS:
+        raise UserInputError(
+            f"Invalid action '{action}'. Must be one of: {', '.join(SUGGESTION_ACTIONS)}."
+        )
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+
+    if action == "list":
+        doc = await asyncio.to_thread(
+            service.documents()
+            .get(
+                documentId=document_id,
+                includeTabsContent=True,
+                suggestionsViewMode="SUGGESTIONS_INLINE",
+            )
+            .execute
+        )
+        return format_suggestions(collect_suggestions(doc), document_id, tab_id)
+
+    try:
+        ids = normalize_suggestion_ids(suggestion_ids)
+    except ValueError as e:
+        raise UserInputError(str(e)) from e
+    if not ids:
+        raise UserInputError(
+            f"'suggestion_ids' is required for the '{action}' action; "
+            "use action='list' to find them."
+        )
+
+    requests = [create_suggestion_action_request(action, sid) for sid in ids]
+    await asyncio.to_thread(
+        service.documents()
+        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .execute
+    )
+    verb = {"accept": "Accepted", "reject": "Rejected", "delete": "Deleted"}[action]
+    return (
+        f"{verb} {len(ids)} suggestion(s) in document {document_id}: "
+        f"{', '.join(ids)}. Link: {link}"
+    )
 
 
 # Create comment management tools for documents

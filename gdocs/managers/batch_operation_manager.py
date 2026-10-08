@@ -45,6 +45,20 @@ from gdocs.docs_helpers import (
     create_update_table_column_properties_request,
     create_update_table_row_style_request,
     create_pin_table_header_rows_request,
+    create_insert_person_request,
+    create_insert_date_request,
+    create_insert_rich_link_request,
+    create_create_footnote_request,
+    create_dropdown_definition_request,
+    create_insert_dropdown_request,
+    create_replace_image_request,
+    create_delete_header_request,
+    create_delete_footer_request,
+    create_delete_positioned_object_request,
+    create_update_named_style_request,
+    build_batch_update_body,
+    validate_write_mode,
+    INSERTION_OPERATION_TYPES,
     validate_operation,
 )
 from gdocs.managers.validation_manager import ValidationManager
@@ -95,7 +109,10 @@ class BatchOperationManager:
         self.validation_manager = ValidationManager()
 
     async def execute_batch_operations(
-        self, document_id: str, operations: list[dict[str, Any]]
+        self,
+        document_id: str,
+        operations: list[dict[str, Any]],
+        write_mode: str = "EDIT",
     ) -> tuple[bool, str, dict[str, Any]]:
         """
         Execute multiple document operations in a single atomic batch.
@@ -105,6 +122,8 @@ class BatchOperationManager:
         Args:
             document_id: ID of the document to update
             operations: List of operation dictionaries
+            write_mode: "EDIT" applies changes directly; "SUGGEST" records every
+                request as a tracked suggestion (writeControl.writeMode).
 
         Returns:
             Tuple of (success, message, metadata)
@@ -118,6 +137,11 @@ class BatchOperationManager:
                 "No operations provided. Please provide at least one operation.",
                 {},
             )
+
+        try:
+            write_mode = validate_write_mode(write_mode)
+        except ValueError as e:
+            return False, str(e), {}
 
         try:
             # Anchor resolution rewrites locations and order; leave caller data intact.
@@ -143,7 +167,15 @@ class BatchOperationManager:
             revision_before = await self._get_revision_id(document_id)
 
             # Execute the batch
-            result = await self._execute_batch_requests(document_id, requests)
+            result = await self._execute_batch_requests(
+                document_id, requests, write_mode
+            )
+
+            # Footnote text can only be written once the footnote's segment ID
+            # exists, so it goes in a second batch keyed off the replies.
+            created_footnotes = await self._write_footnote_text(
+                document_id, operations, result, write_mode
+            )
 
             # Process results
             metadata = {
@@ -151,9 +183,15 @@ class BatchOperationManager:
                 "requests_count": len(requests),
                 "replies_count": len(result.get("replies", [])),
                 "operation_summary": operation_descriptions[:5],  # First 5 operations
+                "write_mode": write_mode,
             }
 
             metadata["revision_before"] = revision_before
+            if created_footnotes:
+                metadata["created_footnotes"] = created_footnotes
+            created_dropdowns = self._extract_created_dropdown_definitions(result)
+            if created_dropdowns:
+                metadata["created_dropdown_definitions"] = created_dropdowns
 
             # One post-batch read serves both the document length (for chaining)
             # and the affected-range snapshot (so the caller can see what the
@@ -206,11 +244,28 @@ class BatchOperationManager:
 
             summary = self._build_operation_summary(operation_descriptions)
             msg = f"Successfully executed {len(operations)} operations ({summary})"
+            if write_mode == "SUGGEST":
+                msg += " as tracked suggestions"
             if created_tabs:
                 tab_info = ", ".join(
                     f"'{t['title']}' (tab_id: {t['tab_id']})" for t in created_tabs
                 )
                 msg += f". Created tabs: {tab_info}"
+            if created_footnotes:
+                footnote_info = ", ".join(
+                    f"{f['footnote_id']}{' (text written)' if f['text_written'] else ''}"
+                    for f in created_footnotes
+                )
+                msg += f". Created footnotes (segment IDs): {footnote_info}"
+            if created_dropdowns:
+                dropdown_info = "; ".join(
+                    f"{d['dropdown_definition_id']} options: "
+                    + ", ".join(
+                        f"'{o['display_value']}'={o['option_id']}" for o in d["options"]
+                    )
+                    for d in created_dropdowns
+                )
+                msg += f". Created dropdown definitions: {dropdown_info}"
 
             return True, msg, metadata
 
@@ -240,13 +295,7 @@ class BatchOperationManager:
             return None
 
         for op in anchored:
-            if op.get("type") not in {
-                "insert_text",
-                "insert_table",
-                "insert_page_break",
-                "insert_section_break",
-                "insert_image",
-            }:
+            if op.get("type") not in INSERTION_OPERATION_TYPES:
                 return "Semantic anchors are supported only for insertion operations."
             valid, error = validate_operation(op)
             if not valid:
@@ -351,7 +400,11 @@ class BatchOperationManager:
             if start is None:
                 continue
             end = op.get("end_index")
-            if end is None:
+            if end is None and op.get("type") == "create_footnote":
+                # The text goes into the footnote segment; only the reference
+                # mark occupies a body index.
+                end = start + 1
+            elif end is None:
                 end = start + utf16_length(op.get("text") or "")
             starts.append(start)
             ends.append(end)
@@ -1100,6 +1153,140 @@ class BatchOperationManager:
                 f"for table at {op['table_start_index']}"
             )
 
+        elif op_type == "insert_person":
+            request = create_insert_person_request(
+                op.get("index"),
+                op["email"],
+                name=op.get("name"),
+                tab_id=tab_id,
+                segment_id=segment_id,
+                end_of_segment=end_of_segment,
+            )
+            description = (
+                f"insert person chip '{op['email']}' at end of segment '{segment_id or 'body'}'"
+                if end_of_segment
+                else f"insert person chip '{op['email']}' at {op.get('index')}"
+            )
+
+        elif op_type == "insert_date":
+            request = create_insert_date_request(
+                op.get("index"),
+                op["date"],
+                date_format=op.get("date_format"),
+                time_format=op.get("time_format"),
+                time_zone_id=op.get("time_zone_id"),
+                locale=op.get("locale"),
+                tab_id=tab_id,
+                segment_id=segment_id,
+                end_of_segment=end_of_segment,
+            )
+            description = (
+                f"insert date chip '{op['date']}' at end of segment '{segment_id or 'body'}'"
+                if end_of_segment
+                else f"insert date chip '{op['date']}' at {op.get('index')}"
+            )
+
+        elif op_type == "insert_rich_link":
+            request = create_insert_rich_link_request(
+                op.get("index"),
+                op["uri"],
+                title=op.get("title"),
+                tab_id=tab_id,
+                segment_id=segment_id,
+                end_of_segment=end_of_segment,
+            )
+            description = (
+                f"insert rich link at end of segment '{segment_id or 'body'}'"
+                if end_of_segment
+                else f"insert rich link at {op.get('index')}"
+            )
+
+        elif op_type == "create_footnote":
+            if segment_id:
+                raise ValueError(
+                    "create_footnote cannot target a segment; footnote references "
+                    "live in the document body"
+                )
+            request = create_create_footnote_request(
+                op.get("index"), tab_id=tab_id, end_of_segment=end_of_segment
+            )
+            description = (
+                "create footnote at end of body"
+                if end_of_segment
+                else f"create footnote at {op.get('index')}"
+            )
+            if op.get("text"):
+                description += " with text"
+
+        elif op_type == "create_dropdown_definition":
+            request = create_dropdown_definition_request(
+                op["options"],
+                dropdown_definition_id=op.get("dropdown_definition_id"),
+                title=op.get("title"),
+                tab_id=tab_id,
+            )
+            description = (
+                f"create dropdown definition with {len(op['options'])} options"
+            )
+            if op.get("dropdown_definition_id"):
+                description += f" ({op['dropdown_definition_id']})"
+
+        elif op_type == "insert_dropdown":
+            request = create_insert_dropdown_request(
+                op.get("index"),
+                op["dropdown_definition_id"],
+                selected_option_id=op.get("selected_option_id"),
+                tab_id=tab_id,
+                segment_id=segment_id,
+                end_of_segment=end_of_segment,
+            )
+            description = (
+                f"insert dropdown '{op['dropdown_definition_id']}' at end of segment '{segment_id or 'body'}'"
+                if end_of_segment
+                else f"insert dropdown '{op['dropdown_definition_id']}' at {op.get('index')}"
+            )
+
+        elif op_type == "replace_image":
+            request = create_replace_image_request(
+                op["image_object_id"],
+                op["uri"],
+                image_replace_method=op.get("image_replace_method"),
+                tab_id=tab_id,
+            )
+            description = f"replace image '{op['image_object_id']}'"
+
+        elif op_type == "delete_header":
+            request = create_delete_header_request(op["header_id"], tab_id=tab_id)
+            description = f"delete header '{op['header_id']}'"
+
+        elif op_type == "delete_footer":
+            request = create_delete_footer_request(op["footer_id"], tab_id=tab_id)
+            description = f"delete footer '{op['footer_id']}'"
+
+        elif op_type == "delete_positioned_object":
+            request = create_delete_positioned_object_request(
+                op["object_id"], tab_id=tab_id
+            )
+            description = f"delete positioned object '{op['object_id']}'"
+
+        elif op_type == "update_named_style":
+            style_kwargs = {
+                key: value
+                for key, value in op.items()
+                if key not in {"type", "tab_id", "named_style_type"}
+            }
+            request = create_update_named_style_request(
+                op["named_style_type"], tab_id=tab_id, **style_kwargs
+            )
+            if not request:
+                raise ValueError(
+                    "update_named_style requires at least one text or paragraph style field"
+                )
+            changed = ", ".join(
+                key for key, value in style_kwargs.items() if value is not None
+            )
+            description = f"update named style {op['named_style_type']} ({changed})"
+
         else:
             supported_types = [
                 "insert_text",
@@ -1132,6 +1319,17 @@ class BatchOperationManager:
                 "update_table_column_properties",
                 "update_table_row_style",
                 "pin_table_header_rows",
+                "insert_person",
+                "insert_date",
+                "insert_rich_link",
+                "create_footnote",
+                "create_dropdown_definition",
+                "insert_dropdown",
+                "replace_image",
+                "delete_header",
+                "delete_footer",
+                "update_named_style",
+                "delete_positioned_object",
             ]
             raise ValueError(
                 f"Unsupported operation type '{op_type}'. Supported: {', '.join(supported_types)}"
@@ -1140,7 +1338,10 @@ class BatchOperationManager:
         return request, description
 
     async def _execute_batch_requests(
-        self, document_id: str, requests: list[dict[str, Any]]
+        self,
+        document_id: str,
+        requests: list[dict[str, Any]],
+        write_mode: str = "EDIT",
     ) -> dict[str, Any]:
         """
         Execute the batch requests against the Google Docs API.
@@ -1148,15 +1349,97 @@ class BatchOperationManager:
         Args:
             document_id: Document ID
             requests: List of API requests
+            write_mode: EDIT or SUGGEST; SUGGEST adds writeControl to the body
 
         Returns:
             API response
         """
         return await asyncio.to_thread(
             self.service.documents()
-            .batchUpdate(documentId=document_id, body={"requests": requests})
+            .batchUpdate(
+                documentId=document_id,
+                body=build_batch_update_body(requests, write_mode),
+            )
             .execute
         )
+
+    async def _write_footnote_text(
+        self,
+        document_id: str,
+        operations: list[dict[str, Any]],
+        result: dict[str, Any],
+        write_mode: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Write the text of create_footnote operations into their new segments.
+
+        Replies come back in request order and each create_footnote produces one
+        request, so the n-th createFootnote reply belongs to the n-th
+        create_footnote operation in (already anchor-sorted) operation order.
+        """
+        footnote_ops = [op for op in operations if op.get("type") == "create_footnote"]
+        if not footnote_ops:
+            return []
+
+        footnote_ids = [
+            reply["createFootnote"].get("footnoteId")
+            for reply in result.get("replies", [])
+            if "createFootnote" in reply
+        ]
+
+        created = []
+        follow_up = []
+        for op, footnote_id in zip(footnote_ops, footnote_ids):
+            entry = {
+                "footnote_id": footnote_id,
+                "tab_id": op.get("tab_id"),
+                "text_written": False,
+            }
+            if footnote_id and op.get("text"):
+                follow_up.append(
+                    create_insert_text_request(
+                        None,
+                        op["text"],
+                        op.get("tab_id"),
+                        segment_id=footnote_id,
+                        end_of_segment=True,
+                    )
+                )
+                entry["text_written"] = True
+            created.append(entry)
+
+        if follow_up:
+            await self._execute_batch_requests(document_id, follow_up, write_mode)
+        return created
+
+    @staticmethod
+    def _extract_created_dropdown_definitions(
+        result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """IDs of dropdown definitions (and their options) created by the batch."""
+        created = []
+        for reply in result.get("replies", []):
+            definition = reply.get("createDropdownDefinition", {}).get(
+                "dropdownDefinition"
+            )
+            if not definition:
+                continue
+            options = definition.get("dropdownDefinitionProperties", {}).get(
+                "options", []
+            )
+            created.append(
+                {
+                    "dropdown_definition_id": definition.get("dropdownDefinitionId"),
+                    "options": [
+                        {
+                            "display_value": option.get("displayValue"),
+                            "option_id": option.get("optionId"),
+                        }
+                        for option in options
+                    ],
+                }
+            )
+        return created
 
     def _extract_created_tabs(self, result: dict[str, Any]) -> list[dict[str, str]]:
         """
@@ -1490,6 +1773,140 @@ class BatchOperationManager:
                     "required": ["table_start_index", "pinned_header_rows_count"],
                     "optional": ["tab_id"],
                     "description": "Pin (repeat) the leading N rows of a table as a header on every page",
+                },
+                "insert_person": {
+                    "required": ["email"],
+                    "optional": [
+                        "name",
+                        "index",
+                        "end_of_segment",
+                        "after_heading",
+                        "before_heading",
+                        "anchor_text",
+                        "segment_id",
+                        "tab_id",
+                    ],
+                    "description": "Insert a person smart chip linked to an email address",
+                },
+                "insert_date": {
+                    "required": ["date"],
+                    "optional": [
+                        "date_format",
+                        "time_format",
+                        "time_zone_id",
+                        "locale",
+                        "index",
+                        "end_of_segment",
+                        "after_heading",
+                        "before_heading",
+                        "anchor_text",
+                        "segment_id",
+                        "tab_id",
+                    ],
+                    "description": "Insert a date smart chip for an ISO 8601 date",
+                },
+                "insert_rich_link": {
+                    "required": ["uri"],
+                    "optional": [
+                        "title",
+                        "index",
+                        "end_of_segment",
+                        "after_heading",
+                        "before_heading",
+                        "anchor_text",
+                        "segment_id",
+                        "tab_id",
+                    ],
+                    "description": "Insert a rich-link smart chip for a Drive, YouTube or Calendar URL",
+                },
+                "create_footnote": {
+                    "required": [],
+                    "optional": [
+                        "text",
+                        "index",
+                        "end_of_segment",
+                        "after_heading",
+                        "before_heading",
+                        "anchor_text",
+                        "tab_id",
+                    ],
+                    "description": "Create a footnote reference in the body, optionally writing its text",
+                },
+                "create_dropdown_definition": {
+                    "required": ["options"],
+                    "optional": ["dropdown_definition_id", "title", "tab_id"],
+                    "description": "Define a dropdown (2-50 options) that insert_dropdown can place",
+                },
+                "insert_dropdown": {
+                    "required": ["dropdown_definition_id"],
+                    "optional": [
+                        "selected_option_id",
+                        "index",
+                        "end_of_segment",
+                        "after_heading",
+                        "before_heading",
+                        "anchor_text",
+                        "segment_id",
+                        "tab_id",
+                    ],
+                    "description": "Insert a dropdown chip for an existing dropdown definition",
+                },
+                "replace_image": {
+                    "required": ["image_object_id", "uri"],
+                    "optional": ["image_replace_method", "tab_id"],
+                    "description": "Replace an existing image with the image at uri",
+                },
+                "delete_header": {
+                    "required": ["header_id"],
+                    "optional": ["tab_id"],
+                    "description": "Delete a header by ID",
+                },
+                "delete_footer": {
+                    "required": ["footer_id"],
+                    "optional": ["tab_id"],
+                    "description": "Delete a footer by ID",
+                },
+                "update_named_style": {
+                    "required": ["named_style_type"],
+                    "optional": [
+                        "bold",
+                        "italic",
+                        "underline",
+                        "strikethrough",
+                        "font_size",
+                        "font_family",
+                        "font_weight",
+                        "text_color",
+                        "background_color",
+                        "baseline_offset",
+                        "small_caps",
+                        "alignment",
+                        "line_spacing",
+                        "indent_first_line",
+                        "indent_start",
+                        "indent_end",
+                        "space_above",
+                        "space_below",
+                        "direction",
+                        "keep_lines_together",
+                        "keep_with_next",
+                        "avoid_widow_and_orphan",
+                        "page_break_before",
+                        "spacing_mode",
+                        "shading_color",
+                        "border_edges",
+                        "border_color",
+                        "border_width",
+                        "border_padding",
+                        "border_dash",
+                        "tab_id",
+                    ],
+                    "description": "Redefine a named style (NORMAL_TEXT, TITLE, HEADING_1..6) document-wide",
+                },
+                "delete_positioned_object": {
+                    "required": ["object_id"],
+                    "optional": ["tab_id"],
+                    "description": "Delete a positioned (floating) object by ID",
                 },
             },
             "example_operations": [
