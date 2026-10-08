@@ -155,6 +155,9 @@ contacts:
   complete:
     - manage_contacts_batch
     - manage_contact_group
+    - list_other_contacts
+    - search_directory
+    - manage_contact_photo
 
 search:
   core:

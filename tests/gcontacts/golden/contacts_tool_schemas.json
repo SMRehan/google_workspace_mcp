@@ -255,11 +255,12 @@
     "additionalProperties": false,
     "properties": {
       "action": {
-        "description": "The action to perform: \"create\", \"update\", or \"delete\".",
+        "description": "The action to perform: \"create\", \"update\", \"delete\", or\n\"copy_to_my_contacts\" (promote an auto-saved \"Other contact\" found via\nlist_other_contacts into My Contacts; the token also needs the\ncontacts.other.readonly scope).",
         "enum": [
           "create",
           "update",
-          "delete"
+          "delete",
+          "copy_to_my_contacts"
         ],
         "type": "string"
       },
@@ -297,7 +298,7 @@
           }
         ],
         "default": null,
-        "description": "The contact ID. Required for \"update\" and \"delete\" actions."
+        "description": "The contact ID. Required for \"update\" and \"delete\"\nactions (\"c123\" or \"people/c123\"), and for \"copy_to_my_contacts\"\n(\"otherContacts/c123\", as returned by list_other_contacts)."
       },
       "email": {
         "anyOf": [

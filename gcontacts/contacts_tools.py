@@ -19,7 +19,11 @@ from auth.service_decorator import require_google_service
 from core.server import server
 from core.utils import UserInputError, handle_http_errors, StringList
 from gcontacts.contacts_helpers import (
+    DIRECTORY_READ_MASK,
+    OTHER_CONTACTS_READ_MASK,
+    _encode_photo_bytes,
     _format_contact,
+    _format_person_page,
     _merge_emails,
     _merge_names,
     _merge_nicknames,
@@ -28,7 +32,12 @@ from gcontacts.contacts_helpers import (
     _merge_relations,
     _merge_urls,
     _merge_user_defined,
+    _normalize_directory_sources,
+    _normalize_read_mask,
+    _normalize_resource_name,
     _parse_birthday,
+    _resolve_photo_bytes,
+    _unwrap_search_results,
 )
 
 logger = logging.getLogger(__name__)
@@ -762,7 +771,7 @@ async def search_contacts(
 async def manage_contact(
     service: Resource,
     user_google_email: str,
-    action: Literal["create", "update", "delete"],
+    action: Literal["create", "update", "delete", "copy_to_my_contacts"],
     contact_id: Optional[str] = None,
     given_name: Optional[str] = None,
     family_name: Optional[str] = None,
@@ -792,13 +801,18 @@ async def manage_contact(
     job_title: Optional[str] = None,
 ) -> str:
     """
-    Create, update, or delete a contact. Consolidated tool replacing create_contact,
-    update_contact, and delete_contact.
+    Create, update, or delete a contact, or copy an "Other contact" into My Contacts.
+    Consolidated tool replacing create_contact, update_contact, and delete_contact.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
-        action (str): The action to perform: "create", "update", or "delete".
-        contact_id (Optional[str]): The contact ID. Required for "update" and "delete" actions.
+        action (str): The action to perform: "create", "update", "delete", or
+            "copy_to_my_contacts" (promote an auto-saved "Other contact" found via
+            list_other_contacts into My Contacts; the token also needs the
+            contacts.other.readonly scope).
+        contact_id (Optional[str]): The contact ID. Required for "update" and "delete"
+            actions ("c123" or "people/c123"), and for "copy_to_my_contacts"
+            ("otherContacts/c123", as returned by list_other_contacts).
         given_name (Optional[str]): First name (for create/update).
         family_name (Optional[str]): Last name (for create/update).
         phones (Optional[List[Dict]]): List of phone dicts {number, type?}.
@@ -841,9 +855,10 @@ async def manage_contact(
         str: Result of the action performed.
     """
     action = action.lower().strip()
-    if action not in ("create", "update", "delete"):
+    if action not in ("create", "update", "delete", "copy_to_my_contacts"):
         raise UserInputError(
-            f"Invalid action '{action}'. Must be 'create', 'update', or 'delete'."
+            f"Invalid action '{action}'. Must be 'create', 'update', 'delete', "
+            "or 'copy_to_my_contacts'."
         )
 
     for mode_name, mode_val in [
@@ -902,9 +917,31 @@ async def manage_contact(
         logger.info(f"Created contact {created_id} for {user_google_email}")
         return response
 
-    # update and delete both require contact_id
+    # update, delete and copy_to_my_contacts all require contact_id
     if not contact_id:
         raise UserInputError(f"contact_id is required for '{action}' action.")
+
+    if action == "copy_to_my_contacts":
+        other_resource_name = _normalize_resource_name(contact_id, "otherContacts")
+        if not other_resource_name.startswith("otherContacts/"):
+            raise UserInputError(
+                "contact_id for 'copy_to_my_contacts' must be an \"Other contact\" "
+                "resource name like 'otherContacts/c123'."
+            )
+        result = await asyncio.to_thread(
+            service.otherContacts()
+            .copyOtherContactToMyContactsGroup(
+                resourceName=other_resource_name,
+                body={"readMask": DETAILED_PERSON_FIELDS},
+            )
+            .execute
+        )
+        response = f"Other contact copied to My Contacts for {user_google_email}:\n\n"
+        response += _format_contact(result, detailed=True)
+        logger.info(
+            f"Copied other contact {other_resource_name} to My Contacts for {user_google_email}"
+        )
+        return response
 
     # Normalize resource name
     if not contact_id.startswith("people/"):
@@ -1700,4 +1737,262 @@ async def manage_contact_group(
     logger.info(
         f"Modified contact group members for {resource_name} for {user_google_email}"
     )
+    return response
+
+
+# =============================================================================
+# Complete Tier Tools: other contacts, directory, photos
+# =============================================================================
+
+
+@server.tool(
+    title="List Other Contacts",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("people", "contacts_other_read")
+@handle_http_errors("list_other_contacts", service_type="people")
+async def list_other_contacts(
+    service: Resource,
+    user_google_email: str,
+    action: Literal["list", "search"] = "list",
+    query: Optional[str] = None,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+    read_mask: Optional[str] = None,
+) -> str:
+    """
+    List or search "Other contacts": people the user has interacted with (e.g. emailed)
+    who are not saved in My Contacts. Use manage_contact action="copy_to_my_contacts"
+    with the returned "otherContacts/..." ID to promote one into My Contacts.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        action (str): "list" (paged listing, default) or "search" (prefix match on
+            names, emails and phone numbers).
+        query (Optional[str]): Search text. Required for "search".
+        page_size (int): Results per page. "list": 1-1000 (default 100).
+            "search": 1-30 (values above 30 are capped by the API).
+        page_token (Optional[str]): Token from a previous "list" page. Ignored by "search".
+        read_mask (Optional[str]): Comma-separated Person fields to return. Other contacts
+            support only names, emailAddresses, phoneNumbers, metadata (and photos for
+            "list"). Default: "names,emailAddresses,phoneNumbers,metadata".
+
+    Returns:
+        str: Matching other contacts with IDs like "otherContacts/c123", plus a next page token when more exist.
+    """
+    action = (action or "list").lower().strip()
+    if action not in ("list", "search"):
+        raise UserInputError(f"Invalid action '{action}'. Must be 'list' or 'search'.")
+    if page_size < 1:
+        raise UserInputError("page_size must be >= 1")
+    mask = _normalize_read_mask(read_mask, OTHER_CONTACTS_READ_MASK)
+
+    logger.info(
+        f"[list_other_contacts] Invoked. Action: '{action}', Email: '{user_google_email}'"
+    )
+
+    if action == "search":
+        if not query or not query.strip():
+            raise UserInputError("query is required for 'search' action.")
+        result = await asyncio.to_thread(
+            service.otherContacts()
+            .search(query=query, readMask=mask, pageSize=min(page_size, 30))
+            .execute
+        )
+        people = _unwrap_search_results(result.get("results", []))
+        return _format_person_page(
+            people,
+            heading=f"Other contacts matching '{query}' for {user_google_email}",
+            empty_message=f"No other contacts found matching '{query}' for {user_google_email}.",
+        )
+
+    params: Dict[str, Any] = {
+        "readMask": mask,
+        "pageSize": min(page_size, 1000),
+    }
+    if page_token:
+        params["pageToken"] = page_token
+    result = await asyncio.to_thread(service.otherContacts().list(**params).execute)
+    people = result.get("otherContacts", [])
+    return _format_person_page(
+        people,
+        heading=f"Other contacts for {user_google_email}",
+        empty_message=f"No other contacts found for {user_google_email}.",
+        next_page_token=result.get("nextPageToken"),
+        total_size=result.get("totalSize"),
+    )
+
+
+@server.tool(
+    title="Search Directory",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("people", "directory_read")
+@handle_http_errors("search_directory", service_type="people")
+async def search_directory(
+    service: Resource,
+    user_google_email: str,
+    action: Literal["search", "list"] = "search",
+    query: Optional[str] = None,
+    sources: Optional[StringList] = None,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+    read_mask: Optional[str] = None,
+) -> str:
+    """
+    Search or list people in the Google Workspace domain directory (colleagues'
+    profiles and domain shared contacts). Google Workspace accounts only: personal
+    @gmail.com accounts have no directory and get a 403/empty result.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        action (str): "search" (prefix match on the person's fields, default) or
+            "list" (page through the whole directory).
+        query (Optional[str]): Search text. Required for "search".
+        sources (Optional[List[str]]): Directory sources: "DOMAIN_PROFILE" (user profiles)
+            and/or "DOMAIN_CONTACT" (domain shared contacts). Full enum names
+            "DIRECTORY_SOURCE_TYPE_*" are also accepted. Default: both.
+        page_size (int): Results per page. "search": 1-500; "list": 1-1000 (default 100).
+        page_token (Optional[str]): Token from a previous page of the same action.
+        read_mask (Optional[str]): Comma-separated Person fields to return.
+            Default: "names,emailAddresses,phoneNumbers,organizations".
+
+    Returns:
+        str: Directory people with their basic information, plus a next page token when more exist.
+    """
+    action = (action or "search").lower().strip()
+    if action not in ("search", "list"):
+        raise UserInputError(f"Invalid action '{action}'. Must be 'search' or 'list'.")
+    if page_size < 1:
+        raise UserInputError("page_size must be >= 1")
+    directory_sources = _normalize_directory_sources(sources)
+    mask = _normalize_read_mask(read_mask, DIRECTORY_READ_MASK)
+
+    logger.info(
+        f"[search_directory] Invoked. Action: '{action}', Email: '{user_google_email}'"
+    )
+
+    params: Dict[str, Any] = {"readMask": mask, "sources": directory_sources}
+    if page_token:
+        params["pageToken"] = page_token
+
+    if action == "search":
+        if not query or not query.strip():
+            raise UserInputError("query is required for 'search' action.")
+        params["query"] = query
+        params["pageSize"] = min(page_size, 500)
+        result = await asyncio.to_thread(
+            service.people().searchDirectoryPeople(**params).execute
+        )
+        return _format_person_page(
+            result.get("people", []),
+            heading=f"Directory people matching '{query}' for {user_google_email}",
+            empty_message=f"No directory people found matching '{query}' for {user_google_email}.",
+            next_page_token=result.get("nextPageToken"),
+            total_size=result.get("totalSize"),
+        )
+
+    params["pageSize"] = min(page_size, 1000)
+    result = await asyncio.to_thread(
+        service.people().listDirectoryPeople(**params).execute
+    )
+    return _format_person_page(
+        result.get("people", []),
+        heading=f"Directory people for {user_google_email}",
+        empty_message=f"No directory people found for {user_google_email}.",
+        next_page_token=result.get("nextPageToken"),
+    )
+
+
+@server.tool(
+    title="Manage Contact Photo",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("people", "contacts")
+@handle_http_errors("manage_contact_photo", service_type="people")
+async def manage_contact_photo(
+    service: Resource,
+    user_google_email: str,
+    action: Literal["update", "delete"],
+    contact_id: str,
+    image_url: Optional[str] = None,
+    image_base64: Optional[str] = None,
+) -> str:
+    """
+    Set or remove a contact's photo.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        action (str): "update" (set/replace the photo) or "delete" (remove it).
+        contact_id (str): The contact ID ("c123" or "people/c123").
+        image_url (Optional[str]): For "update": public http(s) URL of the image; it is
+            downloaded server-side (max 10 MiB). Provide this or image_base64, not both.
+        image_base64 (Optional[str]): For "update": the image as base64 (a
+            "data:image/...;base64," prefix is accepted).
+
+    Returns:
+        str: The updated contact (with photo URL) or a deletion confirmation.
+    """
+    action = (action or "").lower().strip()
+    if action not in ("update", "delete"):
+        raise UserInputError(
+            f"Invalid action '{action}'. Must be 'update' or 'delete'."
+        )
+    resource_name = _normalize_resource_name(contact_id, "people")
+
+    logger.info(
+        f"[manage_contact_photo] Invoked. Action: '{action}', Email: '{user_google_email}', "
+        f"Contact: {resource_name}"
+    )
+
+    if action == "delete":
+        result = await asyncio.to_thread(
+            service.people()
+            .deleteContactPhoto(
+                resourceName=resource_name, personFields=DETAILED_PERSON_FIELDS
+            )
+            .execute
+        )
+        response = (
+            f"Photo removed from contact {resource_name} for {user_google_email}."
+        )
+        person = (result or {}).get("person")
+        if person:
+            response += "\n\n" + _format_contact(person, detailed=True)
+        logger.info(f"Deleted photo of {resource_name} for {user_google_email}")
+        return response
+
+    raw = await _resolve_photo_bytes(image_base64, image_url)
+    body = {
+        "photoBytes": _encode_photo_bytes(raw),
+        "personFields": DETAILED_PERSON_FIELDS,
+    }
+    result = await asyncio.to_thread(
+        service.people()
+        .updateContactPhoto(resourceName=resource_name, body=body)
+        .execute
+    )
+    response = f"Photo updated ({len(raw)} bytes) for contact {resource_name} for {user_google_email}."
+    person = (result or {}).get("person")
+    if person:
+        response += "\n\n" + _format_contact(person, detailed=True)
+        photos = [p.get("url") for p in person.get("photos", []) if p.get("url")]
+        if photos:
+            response += f"\nPhoto URL: {photos[0]}"
+    logger.info(f"Updated photo of {resource_name} for {user_google_email}")
     return response

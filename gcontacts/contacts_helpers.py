@@ -7,11 +7,14 @@ operate purely on plain dicts/strings and are kept separate from the MCP
 tool definitions and Pydantic input models in contacts_tools.py.
 """
 
+import base64
+import binascii
 import datetime
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+from core.http_utils import redact_url, ssrf_safe_stream
 from core.utils import UserInputError
 
 logger = logging.getLogger(__name__)
@@ -559,3 +562,210 @@ def _merge_names(
         )
     kept = {k: v for k, v in current.items() if k not in _DERIVED_NAME_FIELDS}
     return [{**kept, **new_names[0]}]
+
+
+# =============================================================================
+# "Other contacts", directory and photo helpers
+# =============================================================================
+
+# otherContacts.search only supports these four fields; otherContacts.list adds
+# "photos" when reading READ_SOURCE_TYPE_CONTACT.
+OTHER_CONTACTS_READ_MASK = "names,emailAddresses,phoneNumbers,metadata"
+
+# Field mask used for Workspace directory lookups.
+DIRECTORY_READ_MASK = "names,emailAddresses,phoneNumbers,organizations"
+
+_DIRECTORY_SOURCE_PREFIX = "DIRECTORY_SOURCE_TYPE_"
+DIRECTORY_SOURCE_TYPES = ("DOMAIN_PROFILE", "DOMAIN_CONTACT")
+
+# Contact photos are small images; refuse anything that is clearly not one.
+MAX_CONTACT_PHOTO_BYTES = 10 * 1024 * 1024  # 10 MiB
+_PHOTO_DOWNLOAD_CHUNK_BYTES = 256 * 1024  # 256 KiB
+_REJECTED_PHOTO_CONTENT_TYPES = ("text/", "application/json", "application/xml")
+
+
+def _normalize_resource_name(contact_id: str, prefix: str = "people") -> str:
+    """
+    Expand a bare ID into a People API resource name.
+
+    Args:
+        contact_id: "c123", "people/c123" or "otherContacts/c123".
+        prefix: Collection to assume when the ID carries none.
+
+    Returns:
+        The resource name, e.g. "people/c123".
+    """
+    contact_id = (contact_id or "").strip()
+    if not contact_id:
+        raise UserInputError("contact_id must not be empty.")
+    if "/" in contact_id:
+        return contact_id
+    return f"{prefix}/{contact_id}"
+
+
+def _normalize_read_mask(read_mask: Optional[str], default: str) -> str:
+    """Trim a comma-separated field mask, falling back to ``default``."""
+    if not read_mask:
+        return default
+    fields = [f.strip() for f in read_mask.split(",") if f.strip()]
+    if not fields:
+        return default
+    return ",".join(fields)
+
+
+def _normalize_directory_sources(sources: Optional[List[str]]) -> List[str]:
+    """
+    Accept short ("DOMAIN_PROFILE") or full ("DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE")
+    directory source names and return the full enum values the API expects.
+    Defaults to both source types.
+    """
+    if not sources:
+        return [f"{_DIRECTORY_SOURCE_PREFIX}{t}" for t in DIRECTORY_SOURCE_TYPES]
+    normalized: List[str] = []
+    for source in sources:
+        value = (source or "").strip().upper()
+        if value.startswith(_DIRECTORY_SOURCE_PREFIX):
+            value = value[len(_DIRECTORY_SOURCE_PREFIX) :]
+        if value not in DIRECTORY_SOURCE_TYPES:
+            raise UserInputError(
+                f"Invalid directory source '{source}'. "
+                f"Must be one of: {', '.join(DIRECTORY_SOURCE_TYPES)}."
+            )
+        full = f"{_DIRECTORY_SOURCE_PREFIX}{value}"
+        if full not in normalized:
+            normalized.append(full)
+    return normalized
+
+
+def _format_person_page(
+    people: List[Dict[str, Any]],
+    heading: str,
+    empty_message: str,
+    next_page_token: Optional[str] = None,
+    total_size: Optional[int] = None,
+) -> str:
+    """
+    Render a page of Person resources (list or search results).
+
+    Args:
+        people: Person resources (a search result's ``person`` already unwrapped).
+        heading: First line, without the trailing count.
+        empty_message: Returned verbatim when ``people`` is empty.
+        next_page_token: Surfaced so the caller can continue paginating.
+        total_size: Total count across pages when the API reports one.
+    """
+    if not people:
+        return empty_message
+    count = (
+        f"{len(people)} of {total_size}" if total_size is not None else str(len(people))
+    )
+    lines = [f"{heading} ({count}):", ""]
+    for person in people:
+        lines.append(_format_contact(person))
+        lines.append("")
+    if next_page_token:
+        lines.append(f"Next page token: {next_page_token}")
+    return "\n".join(lines).rstrip("\n") + ("\n" if not next_page_token else "")
+
+
+def _unwrap_search_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Pull the ``person`` out of each People API SearchResult."""
+    return [item.get("person", {}) for item in results if item.get("person")]
+
+
+def _decode_photo_base64(image_base64: str) -> bytes:
+    """
+    Decode a base64 image, tolerating a ``data:image/...;base64,`` prefix and
+    whitespace. Raises UserInputError on malformed or empty input.
+    """
+    data = (image_base64 or "").strip()
+    if data.startswith("data:"):
+        if "," not in data:
+            raise UserInputError("image_base64 data URL is missing its ',' separator.")
+        header, data = data.split(",", 1)
+        if ";base64" not in header:
+            raise UserInputError("image_base64 data URL must be base64-encoded.")
+    data = "".join(data.split())
+    if not data:
+        raise UserInputError("image_base64 must not be empty.")
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise UserInputError(f"image_base64 is not valid base64: {exc}") from exc
+    if not raw:
+        raise UserInputError("image_base64 decoded to zero bytes.")
+    if len(raw) > MAX_CONTACT_PHOTO_BYTES:
+        raise UserInputError(
+            f"Photo is {len(raw)} bytes; the limit is {MAX_CONTACT_PHOTO_BYTES} bytes."
+        )
+    return raw
+
+
+async def _download_photo_from_url(image_url: str) -> bytes:
+    """
+    Download an image server-side with SSRF protection and a size cap.
+
+    Args:
+        image_url: http(s) URL of the image.
+
+    Returns:
+        Raw image bytes.
+    """
+    url = (image_url or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise UserInputError("image_url must start with http:// or https://.")
+    redacted = redact_url(url)
+
+    chunks: List[bytes] = []
+    total = 0
+    async with ssrf_safe_stream(url) as resp:
+        if resp.status_code != 200:
+            raise UserInputError(
+                f"Failed to download image from {redacted} (HTTP {resp.status_code})."
+            )
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        if content_type.startswith(_REJECTED_PHOTO_CONTENT_TYPES):
+            raise UserInputError(
+                f"URL {redacted} returned '{content_type}', not an image."
+            )
+        content_length = resp.headers.get("Content-Length")
+        if content_length and content_length.isdigit():
+            if int(content_length) > MAX_CONTACT_PHOTO_BYTES:
+                raise UserInputError(
+                    f"Image at {redacted} is {content_length} bytes; the limit is "
+                    f"{MAX_CONTACT_PHOTO_BYTES} bytes."
+                )
+        async for chunk in resp.aiter_bytes(chunk_size=_PHOTO_DOWNLOAD_CHUNK_BYTES):
+            total += len(chunk)
+            if total > MAX_CONTACT_PHOTO_BYTES:
+                raise UserInputError(
+                    f"Image at {redacted} exceeds the {MAX_CONTACT_PHOTO_BYTES} byte limit."
+                )
+            chunks.append(chunk)
+
+    raw = b"".join(chunks)
+    if not raw:
+        raise UserInputError(f"Image at {redacted} was empty.")
+    return raw
+
+
+async def _resolve_photo_bytes(
+    image_base64: Optional[str], image_url: Optional[str]
+) -> bytes:
+    """
+    Turn exactly one of ``image_base64`` / ``image_url`` into raw photo bytes.
+    """
+    has_b64 = bool(image_base64 and image_base64.strip())
+    has_url = bool(image_url and image_url.strip())
+    if has_b64 and has_url:
+        raise UserInputError("Provide either image_base64 or image_url, not both.")
+    if has_b64:
+        return _decode_photo_base64(image_base64)
+    if has_url:
+        return await _download_photo_from_url(image_url)
+    raise UserInputError("image_base64 or image_url is required for 'update' action.")
+
+
+def _encode_photo_bytes(raw: bytes) -> str:
+    """Base64-encode raw bytes for the People API ``photoBytes`` field."""
+    return base64.b64encode(raw).decode("ascii")
