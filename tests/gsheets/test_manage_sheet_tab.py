@@ -181,3 +181,44 @@ async def test_reorder_rejects_out_of_bounds_final_index():
             new_index=2,
         )
     service.spreadsheets.return_value.batchUpdate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_copy_to_uses_sheets_copy_to_and_reports_the_new_tab():
+    service = _service(TWO_SHEETS)
+    copy_to = service.spreadsheets.return_value.sheets.return_value.copyTo
+    copy_to.return_value.execute = Mock(
+        return_value={"sheetId": 42, "title": "Copy of February", "index": 3}
+    )
+
+    result = await _unwrap(sheets_tools.manage_sheet_tab)(
+        service=service,
+        user_google_email="user@example.com",
+        spreadsheet_id="sheet123",
+        sheet_name="February",
+        action="copy_to",
+        destination_spreadsheet_id="  dest456 ",
+    )
+
+    copy_to.assert_called_once_with(
+        spreadsheetId="sheet123",
+        sheetId=7,
+        body={"destinationSpreadsheetId": "dest456"},
+    )
+    service.spreadsheets.return_value.batchUpdate.assert_not_called()
+    assert "copied sheet 'February' (ID: 7)" in result
+    assert "to spreadsheet dest456 as 'Copy of February' (ID: 42, index 3)" in result
+
+
+@pytest.mark.asyncio
+async def test_copy_to_without_destination_is_refused():
+    service = _service(TWO_SHEETS)
+    with pytest.raises(UserInputError, match="destination_spreadsheet_id is required"):
+        await _unwrap(sheets_tools.manage_sheet_tab)(
+            service=service,
+            user_google_email="user@example.com",
+            spreadsheet_id="sheet123",
+            sheet_name="February",
+            action="copy_to",
+        )
+    service.spreadsheets.return_value.sheets.return_value.copyTo.assert_not_called()

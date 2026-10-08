@@ -6,6 +6,8 @@ conditional formatting helpers.
 """
 
 import asyncio
+import copy
+import difflib
 import json
 import logging
 import re
@@ -1683,3 +1685,1152 @@ async def _insert_cell_comment(
             f"Sheets API did not return a comment ID for {cell}; check list_spreadsheet_comments before retrying."
         )
     return comment_id
+
+
+# ---------------------------------------------------------------------------
+# Shared fetch / range helpers for the batchUpdate-backed tools
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_sheets(
+    service,
+    spreadsheet_id: str,
+    fields: str = "sheets(properties(sheetId,title))",
+) -> List[dict]:
+    """Fetch the spreadsheet's sheets with the given partial-response fields."""
+    response = await asyncio.to_thread(
+        service.spreadsheets().get(spreadsheetId=spreadsheet_id, fields=fields).execute
+    )
+    return response.get("sheets", []) or []
+
+
+def _sheet_titles_by_id(sheets: List[dict]) -> dict[int, str]:
+    """Map sheetId -> title for every sheet that has an ID."""
+    titles: dict[int, str] = {}
+    for sheet in sheets:
+        props = sheet.get("properties", {}) or {}
+        sid = props.get("sheetId")
+        if sid is not None:
+            titles[sid] = props.get("title", f"Sheet {sid}")
+    return titles
+
+
+def _resolve_scope_grid_range(
+    range_name: Optional[str], sheet_name: Optional[str], sheets: List[dict]
+) -> dict:
+    """
+    Resolve a tool's (range_name, sheet_name) pair to a GridRange.
+
+    - range_name with a sheet prefix wins outright.
+    - range_name without a prefix is scoped to sheet_name (or the first sheet).
+    - No range_name means the whole of sheet_name (or the first sheet).
+    """
+    if range_name:
+        if sheet_name and "!" not in range_name:
+            range_name = f"{_quote_sheet_title_for_a1(sheet_name)}!{range_name}"
+        return _parse_a1_range(range_name, sheets)
+    sheet = _select_sheet(sheets, sheet_name)
+    return {"sheetId": sheet["properties"]["sheetId"]}
+
+
+def _grid_coordinate_from_a1(cell: str, sheets: List[dict]) -> dict:
+    """Convert a single-cell A1 reference (e.g. 'Sheet1!D2') to a GridCoordinate."""
+    grid = _parse_a1_range(cell, sheets)
+    start_row = grid.get("startRowIndex")
+    start_col = grid.get("startColumnIndex")
+    if start_row is None or start_col is None:
+        raise UserInputError(
+            f"'{cell}' must be a single cell with both a column and a row (e.g. 'D2')."
+        )
+    if (
+        grid.get("endRowIndex", start_row + 1) != start_row + 1
+        or grid.get("endColumnIndex", start_col + 1) != start_col + 1
+    ):
+        raise UserInputError(f"'{cell}' must be a single cell, not a range.")
+    return {"sheetId": grid["sheetId"], "rowIndex": start_row, "columnIndex": start_col}
+
+
+def _parse_json_list(value: Any, name: str) -> List[Any]:
+    """Accept a list or a JSON-encoded list; anything else is a UserInputError."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise UserInputError(
+                f"{name} must be a list or a JSON-encoded list."
+            ) from exc
+    if not isinstance(value, list):
+        raise UserInputError(f"{name} must be a list, got {type(value).__name__}.")
+    return value
+
+
+def _resolve_column_index(column: Any, grid_range: dict, label: str) -> int:
+    """
+    Turn a column given as letters ('B') or a zero-based index (1) into the
+    absolute zero-based column index, checking it lies inside grid_range.
+    """
+    if isinstance(column, bool) or column is None:
+        raise UserInputError(f"{label}: 'column' is required (letters or index).")
+    if isinstance(column, int):
+        index = column
+    elif isinstance(column, str) and column.strip():
+        text = column.strip()
+        index = _column_to_index(text)
+        if index is None:
+            if text.isdigit():
+                index = int(text)
+            else:
+                raise UserInputError(
+                    f"{label}: column '{column}' is not valid letters or an index."
+                )
+    else:
+        raise UserInputError(f"{label}: column must be letters or a zero-based index.")
+    if index < 0:
+        raise UserInputError(f"{label}: column index must be non-negative.")
+    start = grid_range.get("startColumnIndex")
+    end = grid_range.get("endColumnIndex")
+    if (start is not None and index < start) or (end is not None and index >= end):
+        raise UserInputError(
+            f"{label}: column {_index_to_column(index)} is outside the range's columns."
+        )
+    return index
+
+
+# ---------------------------------------------------------------------------
+# batch_update_sheet passthrough
+# ---------------------------------------------------------------------------
+
+# Every request type accepted by spreadsheets.batchUpdate, taken from the
+# `Request` schema of the Sheets v4 discovery document.
+BATCH_UPDATE_REQUEST_TYPES = frozenset(
+    {
+        "addBanding",
+        "addChart",
+        "addCommentReply",
+        "addConditionalFormatRule",
+        "addDataSource",
+        "addDimensionGroup",
+        "addFilterView",
+        "addNamedRange",
+        "addProtectedRange",
+        "addSheet",
+        "addSlicer",
+        "addTable",
+        "appendCells",
+        "appendDimension",
+        "autoFill",
+        "autoResizeDimensions",
+        "cancelDataSourceRefresh",
+        "clearBasicFilter",
+        "copyPaste",
+        "createDeveloperMetadata",
+        "cutPaste",
+        "deleteBanding",
+        "deleteComment",
+        "deleteCommentReply",
+        "deleteConditionalFormatRule",
+        "deleteDataSource",
+        "deleteDeveloperMetadata",
+        "deleteDimension",
+        "deleteDimensionGroup",
+        "deleteDuplicates",
+        "deleteEmbeddedObject",
+        "deleteFilterView",
+        "deleteNamedRange",
+        "deleteProtectedRange",
+        "deleteRange",
+        "deleteSheet",
+        "deleteTable",
+        "duplicateFilterView",
+        "duplicateSheet",
+        "findReplace",
+        "insertComment",
+        "insertDimension",
+        "insertRange",
+        "mergeCells",
+        "moveDimension",
+        "pasteData",
+        "randomizeRange",
+        "refreshDataSource",
+        "repeatCell",
+        "setBasicFilter",
+        "setDataValidation",
+        "sortRange",
+        "textToColumns",
+        "trimWhitespace",
+        "unmergeCells",
+        "updateBanding",
+        "updateBorders",
+        "updateCells",
+        "updateChartSpec",
+        "updateCommentPost",
+        "updateConditionalFormatRule",
+        "updateDataSource",
+        "updateDeveloperMetadata",
+        "updateDimensionGroup",
+        "updateDimensionProperties",
+        "updateEmbeddedObjectBorder",
+        "updateEmbeddedObjectPosition",
+        "updateFilterView",
+        "updateNamedRange",
+        "updateProtectedRange",
+        "updateSheetProperties",
+        "updateSlicerSpec",
+        "updateSpreadsheetProperties",
+        "updateTable",
+    }
+)
+
+
+def _validate_batch_update_requests(requests: Any) -> List[dict]:
+    """
+    Check that `requests` is a non-empty list of single-key dicts whose key is
+    a known batchUpdate request type. Returns the (possibly JSON-decoded) list.
+    """
+    if isinstance(requests, str):
+        try:
+            requests = json.loads(requests)
+        except json.JSONDecodeError as exc:
+            raise UserInputError(
+                "requests must be a list of request objects or a JSON-encoded list."
+            ) from exc
+    if not isinstance(requests, list) or not requests:
+        raise UserInputError("requests must be a non-empty list of request objects.")
+
+    for idx, request in enumerate(requests):
+        if not isinstance(request, dict) or len(request) != 1:
+            raise UserInputError(
+                f"requests[{idx}] must be an object with exactly one key naming the "
+                'request type, e.g. {"addSheet": {"properties": {"title": "Q3"}}}.'
+            )
+        (request_type,) = request
+        if request_type not in BATCH_UPDATE_REQUEST_TYPES:
+            close = difflib.get_close_matches(
+                str(request_type), BATCH_UPDATE_REQUEST_TYPES, n=3
+            )
+            hint = (
+                f" Did you mean: {', '.join(close)}?"
+                if close
+                else f" Known types: {', '.join(sorted(BATCH_UPDATE_REQUEST_TYPES))}."
+            )
+            raise UserInputError(
+                f"requests[{idx}]: unknown batchUpdate request type '{request_type}'."
+                + hint
+            )
+        if not isinstance(request[request_type], dict):
+            raise UserInputError(
+                f"requests[{idx}].{request_type} must be an object, "
+                f"got {type(request[request_type]).__name__}."
+            )
+    return requests
+
+
+def _summarize_batch_update_reply(request_type: str, reply: Any) -> str:
+    """One-line, ID-bearing summary of a single batchUpdate reply."""
+    body = reply.get(request_type) if isinstance(reply, dict) else None
+    if not body:
+        return "completed"
+
+    if request_type in ("addSheet", "duplicateSheet"):
+        props = body.get("properties", {}) or {}
+        return (
+            f"sheet '{props.get('title', 'Untitled')}' (sheetId {props.get('sheetId')})"
+        )
+    if request_type == "addNamedRange":
+        named = body.get("namedRange", {}) or {}
+        return f"named range '{named.get('name')}' (namedRangeId {named.get('namedRangeId')})"
+    if request_type in ("addFilterView", "duplicateFilterView"):
+        view = body.get("filter", {}) or {}
+        return f"filter view '{view.get('title')}' (filterViewId {view.get('filterViewId')})"
+    if request_type == "addProtectedRange":
+        protected = body.get("protectedRange", {}) or {}
+        return f"protected range (protectedRangeId {protected.get('protectedRangeId')})"
+    if request_type == "addChart":
+        chart = body.get("chart", {}) or {}
+        return f"chart (chartId {chart.get('chartId')})"
+    if request_type == "addBanding":
+        banded = body.get("bandedRange", {}) or {}
+        return f"banded range (bandedRangeId {banded.get('bandedRangeId')})"
+    if request_type == "addSlicer":
+        slicer = body.get("slicer", {}) or {}
+        return f"slicer (slicerId {slicer.get('slicerId')})"
+    if request_type == "addTable":
+        table = body.get("table", {}) or {}
+        return f"table '{table.get('name')}' (tableId {table.get('tableId')})"
+    if request_type in ("addDimensionGroup", "deleteDimensionGroup"):
+        return f"{len(body.get('dimensionGroups', []) or [])} dimension group(s) now present"
+    if request_type == "findReplace":
+        return _format_find_replace_reply(body)
+    if request_type == "deleteDuplicates":
+        return f"{body.get('duplicatesRemovedCount', 0)} duplicate row(s) removed"
+    if request_type == "trimWhitespace":
+        return f"{body.get('cellsChangedCount', 0)} cell(s) changed"
+    if request_type == "updateConditionalFormatRule":
+        return f"rule now at index {body.get('newIndex')}"
+    if request_type == "deleteConditionalFormatRule":
+        return "conditional format rule deleted"
+    if request_type == "createDeveloperMetadata":
+        meta = body.get("developerMetadata", {}) or {}
+        return f"developer metadata (metadataId {meta.get('metadataId')})"
+    if request_type == "updateEmbeddedObjectPosition":
+        return "embedded object repositioned"
+    if request_type in ("addDataSource", "updateDataSource"):
+        source = body.get("dataSource", {}) or {}
+        return f"data source (dataSourceId {source.get('dataSourceId')})"
+    return "completed"
+
+
+def _summarize_batch_update_replies(
+    requests: List[dict], replies: List[Any]
+) -> List[str]:
+    """Pair each request with its reply and summarize them in order."""
+    lines: List[str] = []
+    for idx, request in enumerate(requests, 1):
+        (request_type,) = request
+        reply = replies[idx - 1] if idx - 1 < len(replies) else {}
+        lines.append(
+            f"  Request {idx} ({request_type}): "
+            f"{_summarize_batch_update_reply(request_type, reply)}"
+        )
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# format_sheet_range: borders and merges
+# ---------------------------------------------------------------------------
+
+BORDER_STYLES = frozenset(
+    {"DOTTED", "DASHED", "SOLID", "SOLID_MEDIUM", "SOLID_THICK", "DOUBLE", "NONE"}
+)
+BORDER_SIDES = ("top", "bottom", "left", "right", "innerHorizontal", "innerVertical")
+BORDER_SIDE_GROUPS = {
+    "all": BORDER_SIDES,
+    "outer": BORDER_SIDES[:4],
+    "inner": BORDER_SIDES[4:],
+}
+_BORDER_SIDE_ALIASES = {
+    "top": "top",
+    "bottom": "bottom",
+    "left": "left",
+    "right": "right",
+    "innerhorizontal": "innerHorizontal",
+    "inner_horizontal": "innerHorizontal",
+    "horizontal": "innerHorizontal",
+    "innervertical": "innerVertical",
+    "inner_vertical": "innerVertical",
+    "vertical": "innerVertical",
+}
+MERGE_TYPES = {"all": "MERGE_ALL", "columns": "MERGE_COLUMNS", "rows": "MERGE_ROWS"}
+
+
+def _normalize_border_sides(border_sides: Optional[Union[str, List[str]]]) -> List[str]:
+    """Expand side names and the 'all'/'outer'/'inner' groups into UpdateBorders keys."""
+    if border_sides is None or border_sides == []:
+        return list(BORDER_SIDES)
+    if isinstance(border_sides, str):
+        try:
+            border_sides = json.loads(border_sides)
+        except json.JSONDecodeError:
+            border_sides = [part for part in border_sides.split(",") if part.strip()]
+    if not isinstance(border_sides, list):
+        raise UserInputError("border_sides must be a list of side names.")
+
+    sides: List[str] = []
+    for raw in border_sides:
+        key = str(raw).strip().lower()
+        if key in BORDER_SIDE_GROUPS:
+            resolved = list(BORDER_SIDE_GROUPS[key])
+        elif key in _BORDER_SIDE_ALIASES:
+            resolved = [_BORDER_SIDE_ALIASES[key]]
+        else:
+            raise UserInputError(
+                f"Unknown border side '{raw}'. Use top, bottom, left, right, "
+                "innerHorizontal, innerVertical, or the groups all, outer, inner."
+            )
+        for side in resolved:
+            if side not in sides:
+                sides.append(side)
+    return sides
+
+
+def _build_update_borders_request(
+    grid_range: dict,
+    border_style: str,
+    border_color: Optional[str],
+    border_sides: Optional[Union[str, List[str]]],
+) -> dict:
+    """Build an updateBorders request applying one border to the chosen sides."""
+    style = (border_style or "").strip().upper()
+    if style not in BORDER_STYLES:
+        raise UserInputError(f"border_style must be one of {sorted(BORDER_STYLES)}.")
+    border: dict = {"style": style}
+    color = _parse_hex_color(border_color)
+    if color:
+        border["color"] = color
+    request: dict = {"range": grid_range}
+    for side in _normalize_border_sides(border_sides):
+        request[side] = dict(border)
+    return {"updateBorders": request}
+
+
+def _build_merge_cells_request(grid_range: dict, merge: str) -> dict:
+    """Build a mergeCells request from merge='all'|'columns'|'rows'."""
+    key = (merge or "").strip().lower()
+    merge_type = MERGE_TYPES.get(key) or (
+        key.upper() if key.upper() in MERGE_TYPES.values() else None
+    )
+    if merge_type is None:
+        raise UserInputError("merge must be one of 'all', 'columns' or 'rows'.")
+    return {"mergeCells": {"range": grid_range, "mergeType": merge_type}}
+
+
+# ---------------------------------------------------------------------------
+# Sort specs and filter specs (sort_sheet_range, manage_sheet_filter)
+# ---------------------------------------------------------------------------
+
+SORT_ORDERS = {
+    "ASCENDING": "ASCENDING",
+    "ASC": "ASCENDING",
+    "DESCENDING": "DESCENDING",
+    "DESC": "DESCENDING",
+}
+
+# Full BooleanCondition.type enum from the discovery document (minus UNSPECIFIED).
+BOOLEAN_CONDITION_TYPES = frozenset(
+    {
+        "NUMBER_GREATER",
+        "NUMBER_GREATER_THAN_EQ",
+        "NUMBER_LESS",
+        "NUMBER_LESS_THAN_EQ",
+        "NUMBER_EQ",
+        "NUMBER_NOT_EQ",
+        "NUMBER_BETWEEN",
+        "NUMBER_NOT_BETWEEN",
+        "TEXT_CONTAINS",
+        "TEXT_NOT_CONTAINS",
+        "TEXT_STARTS_WITH",
+        "TEXT_ENDS_WITH",
+        "TEXT_EQ",
+        "TEXT_NOT_EQ",
+        "TEXT_IS_EMAIL",
+        "TEXT_IS_URL",
+        "DATE_EQ",
+        "DATE_NOT_EQ",
+        "DATE_BEFORE",
+        "DATE_AFTER",
+        "DATE_ON_OR_BEFORE",
+        "DATE_ON_OR_AFTER",
+        "DATE_BETWEEN",
+        "DATE_NOT_BETWEEN",
+        "DATE_IS_VALID",
+        "ONE_OF_RANGE",
+        "ONE_OF_LIST",
+        "BLANK",
+        "NOT_BLANK",
+        "CUSTOM_FORMULA",
+        "BOOLEAN",
+        "FILTER_EXPRESSION",
+    }
+)
+RELATIVE_DATES = frozenset(
+    {"PAST_YEAR", "PAST_MONTH", "PAST_WEEK", "YESTERDAY", "TODAY", "TOMORROW"}
+)
+
+
+def _condition_values_payload(
+    values: Optional[List[Union[str, int, float]]], condition_type: str
+) -> List[dict]:
+    """Wrap raw values as ConditionValue objects; date types accept relative dates."""
+    payload: List[dict] = []
+    for value in values or []:
+        text = str(value)
+        if (
+            condition_type.startswith("DATE_")
+            and text.strip().upper() in RELATIVE_DATES
+        ):
+            payload.append({"relativeDate": text.strip().upper()})
+        else:
+            payload.append({"userEnteredValue": text})
+    return payload
+
+
+def _build_boolean_condition(
+    condition_type: str, condition_values: Any, label: str = "condition_type"
+) -> dict:
+    """Validate a BooleanCondition type and build {type, values}."""
+    normalized = (condition_type or "").strip().upper()
+    if normalized not in BOOLEAN_CONDITION_TYPES:
+        raise UserInputError(
+            f"{label} '{condition_type}' is not a valid condition type. "
+            f"Valid types: {', '.join(sorted(BOOLEAN_CONDITION_TYPES))}."
+        )
+    values = _parse_condition_values(condition_values)
+    condition: dict = {"type": normalized}
+    payload = _condition_values_payload(values, normalized)
+    if payload:
+        condition["values"] = payload
+    return condition
+
+
+def _parse_sort_specs(sort_specs: Any, grid_range: dict) -> List[dict]:
+    """
+    Parse [{"column": "B", "order": "DESCENDING"}, ...] into SortSpec objects.
+    Columns are absolute (sheet) columns given as letters or zero-based indexes.
+    """
+    specs = _parse_json_list(sort_specs, "sort_specs")
+    if not specs:
+        raise UserInputError("sort_specs must contain at least one sort spec.")
+    result: List[dict] = []
+    for idx, spec in enumerate(specs):
+        label = f"sort_specs[{idx}]"
+        if isinstance(spec, str) and spec.strip():
+            spec = {"column": spec}
+        if not isinstance(spec, dict):
+            raise UserInputError(
+                f"{label} must be an object like {{'column': 'B', 'order': 'ASCENDING'}}."
+            )
+        column_index = _resolve_column_index(spec.get("column"), grid_range, label)
+        order_raw = str(spec.get("order", "ASCENDING")).strip().upper()
+        order = SORT_ORDERS.get(order_raw)
+        if order is None:
+            raise UserInputError(
+                f"{label}: order must be ASCENDING or DESCENDING, got '{spec.get('order')}'."
+            )
+        result.append({"dimensionIndex": column_index, "sortOrder": order})
+    return result
+
+
+def _parse_filter_specs(filter_specs: Any, grid_range: dict) -> List[dict]:
+    """
+    Parse [{"column": "B", "hidden_values": [...], "condition_type": ...,
+    "condition_values": [...]}, ...] into FilterSpec objects.
+    """
+    specs = _parse_json_list(filter_specs, "filter_specs")
+    result: List[dict] = []
+    for idx, spec in enumerate(specs):
+        label = f"filter_specs[{idx}]"
+        if not isinstance(spec, dict):
+            raise UserInputError(
+                f"{label} must be an object with 'column' and hidden_values and/or "
+                "condition_type."
+            )
+        column_index = _resolve_column_index(spec.get("column"), grid_range, label)
+        criteria: dict = {}
+        hidden = spec.get("hidden_values")
+        if hidden is not None:
+            hidden_list = _parse_json_list(hidden, f"{label}.hidden_values")
+            criteria["hiddenValues"] = [str(value) for value in hidden_list]
+        if spec.get("condition_type"):
+            criteria["condition"] = _build_boolean_condition(
+                spec["condition_type"],
+                spec.get("condition_values"),
+                label=f"{label}.condition_type",
+            )
+        if not criteria:
+            raise UserInputError(
+                f"{label} needs hidden_values and/or condition_type to filter on."
+            )
+        result.append({"columnIndex": column_index, "filterCriteria": criteria})
+    return result
+
+
+def _build_filter_body(
+    grid_range: dict,
+    sort_specs: Any,
+    filter_specs: Any,
+    title: Optional[str] = None,
+    filter_view_id: Optional[int] = None,
+) -> tuple[dict, List[str]]:
+    """Build a BasicFilter/FilterView body plus the list of fields it sets."""
+    body: dict = {"range": grid_range}
+    fields = ["range"]
+    if filter_view_id is not None:
+        body["filterViewId"] = filter_view_id
+    if title is not None:
+        body["title"] = title
+        fields.append("title")
+    if sort_specs is not None:
+        body["sortSpecs"] = _parse_sort_specs(sort_specs, grid_range)
+        fields.append("sortSpecs")
+    if filter_specs is not None:
+        body["filterSpecs"] = _parse_filter_specs(filter_specs, grid_range)
+        fields.append("filterSpecs")
+    return body, fields
+
+
+def _describe_filter_criteria(filter_obj: dict) -> str:
+    """Count the sort and filter specs on a BasicFilter/FilterView."""
+    parts: List[str] = []
+    sort_specs = filter_obj.get("sortSpecs") or []
+    if sort_specs:
+        parts.append(f"{len(sort_specs)} sort spec(s)")
+    filter_specs = filter_obj.get("filterSpecs") or []
+    criteria = filter_obj.get("criteria") or {}
+    filtered = len(filter_specs) or len(criteria)
+    if filtered:
+        parts.append(f"{filtered} filtered column(s)")
+    return ", ".join(parts) if parts else "no criteria"
+
+
+def _format_filter_views_list(sheets: List[dict], sheet_titles: dict[int, str]) -> str:
+    """List the basic filter and filter views of every sheet."""
+    lines: List[str] = []
+    for sheet in sheets:
+        props = sheet.get("properties", {}) or {}
+        title = props.get("title", "Untitled")
+        basic = sheet.get("basicFilter")
+        views = sheet.get("filterViews") or []
+        if not basic and not views:
+            continue
+        lines.append(f"Sheet '{title}':")
+        if basic:
+            lines.append(
+                f"  Basic filter on {_grid_range_to_a1(basic.get('range', {}), sheet_titles)}"
+                f" ({_describe_filter_criteria(basic)})"
+            )
+        for view in views:
+            lines.append(
+                f"  Filter view '{view.get('title', 'Untitled')}' "
+                f"(ID {view.get('filterViewId')}) on "
+                f"{_grid_range_to_a1(view.get('range', {}), sheet_titles)} "
+                f"({_describe_filter_criteria(view)})"
+            )
+    return "\n".join(lines) if lines else "No basic filters or filter views found."
+
+
+# ---------------------------------------------------------------------------
+# manage_sheet_protection
+# ---------------------------------------------------------------------------
+
+
+def _build_protected_range(
+    grid_range: Optional[dict],
+    description: Optional[str],
+    warning_only: Optional[bool],
+    editors: Optional[List[str]],
+    editor_groups: Optional[List[str]],
+    domain_users_can_edit: Optional[bool],
+    unprotected_ranges: Optional[List[dict]],
+    protected_range_id: Optional[int] = None,
+) -> tuple[dict, List[str]]:
+    """Build a ProtectedRange body plus the field mask of what was supplied."""
+    body: dict = {}
+    fields: List[str] = []
+    if protected_range_id is not None:
+        body["protectedRangeId"] = protected_range_id
+    if grid_range is not None:
+        body["range"] = grid_range
+        fields.append("range")
+    if description is not None:
+        body["description"] = description
+        fields.append("description")
+    if warning_only is not None:
+        body["warningOnly"] = bool(warning_only)
+        fields.append("warningOnly")
+
+    editors_body: dict = {}
+    if editors is not None:
+        editors_body["users"] = [
+            str(e).strip() for e in _parse_json_list(editors, "editors")
+        ]
+    if editor_groups is not None:
+        editors_body["groups"] = [
+            str(g).strip() for g in _parse_json_list(editor_groups, "editor_groups")
+        ]
+    if domain_users_can_edit is not None:
+        editors_body["domainUsersCanEdit"] = bool(domain_users_can_edit)
+    if editors_body:
+        if warning_only:
+            raise UserInputError(
+                "A warning-only protection cannot have editors: set warning_only=False "
+                "or omit editors, editor_groups and domain_users_can_edit."
+            )
+        body["editors"] = editors_body
+        fields.append("editors")
+    if unprotected_ranges is not None:
+        body["unprotectedRanges"] = unprotected_ranges
+        fields.append("unprotectedRanges")
+    return body, fields
+
+
+def _format_protected_ranges_list(
+    sheets: List[dict], sheet_titles: dict[int, str]
+) -> str:
+    """List every protected range with its editors and warning mode."""
+    lines: List[str] = []
+    for sheet in sheets:
+        props = sheet.get("properties", {}) or {}
+        protected = sheet.get("protectedRanges") or []
+        if not protected:
+            continue
+        lines.append(f"Sheet '{props.get('title', 'Untitled')}':")
+        for item in protected:
+            if item.get("range"):
+                scope = _grid_range_to_a1(item["range"], sheet_titles)
+            elif item.get("namedRangeId"):
+                scope = f"named range {item['namedRangeId']}"
+            else:
+                scope = "whole sheet"
+            mode = "warning only" if item.get("warningOnly") else "restricted"
+            editors = item.get("editors") or {}
+            who: List[str] = []
+            if editors.get("users"):
+                who.append("users: " + ", ".join(editors["users"]))
+            if editors.get("groups"):
+                who.append("groups: " + ", ".join(editors["groups"]))
+            if editors.get("domainUsersCanEdit"):
+                who.append("domain users can edit")
+            line = (
+                f"  ID {item.get('protectedRangeId')}: {scope} [{mode}]"
+                + (f" - {item['description']}" if item.get("description") else "")
+                + (f" ({'; '.join(who)})" if who else "")
+            )
+            if item.get("unprotectedRanges"):
+                unprotected = ", ".join(
+                    _grid_range_to_a1(r, sheet_titles)
+                    for r in item["unprotectedRanges"]
+                )
+                line += f" except {unprotected}"
+            lines.append(line)
+    return "\n".join(lines) if lines else "No protected ranges found."
+
+
+# ---------------------------------------------------------------------------
+# manage_sheet_validation
+# ---------------------------------------------------------------------------
+
+VALIDATION_RULE_TYPES = (
+    "list",
+    "range",
+    "checkbox",
+    "number",
+    "date",
+    "text",
+    "custom_formula",
+)
+_CONDITION_ARITY = {
+    "NUMBER_BETWEEN": 2,
+    "NUMBER_NOT_BETWEEN": 2,
+    "DATE_BETWEEN": 2,
+    "DATE_NOT_BETWEEN": 2,
+    "DATE_IS_VALID": 0,
+    "TEXT_IS_EMAIL": 0,
+    "TEXT_IS_URL": 0,
+}
+
+
+def _build_data_validation_rule(
+    rule_type: Optional[str],
+    values: Any,
+    condition_type: Optional[str],
+    strict: bool,
+    show_dropdown: bool,
+    input_message: Optional[str],
+) -> dict:
+    """Build a DataValidationRule for manage_sheet_validation action='set'."""
+    kind = (rule_type or "").strip().lower()
+    if kind not in VALIDATION_RULE_TYPES:
+        raise UserInputError(
+            f"rule_type must be one of {', '.join(VALIDATION_RULE_TYPES)}."
+        )
+    parsed_values = _parse_condition_values(values) or []
+
+    if kind == "list":
+        if not parsed_values:
+            raise UserInputError("rule_type='list' needs at least one entry in values.")
+        condition = {
+            "type": "ONE_OF_LIST",
+            "values": [{"userEnteredValue": str(v)} for v in parsed_values],
+        }
+    elif kind == "range":
+        if len(parsed_values) != 1:
+            raise UserInputError(
+                "rule_type='range' needs exactly one value: the source range as a "
+                "formula, e.g. '=Lists!A2:A20'."
+            )
+        source = str(parsed_values[0]).strip()
+        if not source.startswith("="):
+            source = "=" + source
+        condition = {"type": "ONE_OF_RANGE", "values": [{"userEnteredValue": source}]}
+    elif kind == "checkbox":
+        if parsed_values and len(parsed_values) != 2:
+            raise UserInputError(
+                "rule_type='checkbox' takes no values, or exactly two: "
+                "[checked_value, unchecked_value]."
+            )
+        condition = {"type": "BOOLEAN"}
+        if parsed_values:
+            condition["values"] = [{"userEnteredValue": str(v)} for v in parsed_values]
+    elif kind == "custom_formula":
+        if len(parsed_values) != 1 or not str(parsed_values[0]).startswith("="):
+            raise UserInputError(
+                "rule_type='custom_formula' needs exactly one value: a formula "
+                "starting with '=', e.g. '=A1>0'."
+            )
+        condition = {
+            "type": "CUSTOM_FORMULA",
+            "values": [{"userEnteredValue": str(parsed_values[0])}],
+        }
+    else:
+        prefix = kind.upper() + "_"
+        normalized = (condition_type or "").strip().upper()
+        if (
+            not normalized.startswith(prefix)
+            or normalized not in BOOLEAN_CONDITION_TYPES
+        ):
+            options = sorted(t for t in BOOLEAN_CONDITION_TYPES if t.startswith(prefix))
+            raise UserInputError(
+                f"rule_type='{kind}' needs condition_type to be one of: {', '.join(options)}."
+            )
+        expected = _CONDITION_ARITY.get(normalized, 1)
+        if len(parsed_values) != expected:
+            raise UserInputError(
+                f"condition_type {normalized} needs exactly {expected} value(s) in values, "
+                f"got {len(parsed_values)}."
+            )
+        condition = {"type": normalized}
+        payload = _condition_values_payload(parsed_values, normalized)
+        if payload:
+            condition["values"] = payload
+
+    rule: dict = {"condition": condition, "strict": bool(strict)}
+    if kind in ("list", "range"):
+        rule["showCustomUi"] = bool(show_dropdown)
+    if input_message:
+        rule["inputMessage"] = input_message
+    return rule
+
+
+# ---------------------------------------------------------------------------
+# manage_sheet_chart
+# ---------------------------------------------------------------------------
+
+BASIC_CHART_TYPES = ("BAR", "COLUMN", "LINE", "AREA", "SCATTER")
+CHART_TYPES = BASIC_CHART_TYPES + ("PIE",)
+BASIC_LEGEND_POSITIONS = frozenset(
+    {"BOTTOM_LEGEND", "LEFT_LEGEND", "RIGHT_LEGEND", "TOP_LEGEND", "NO_LEGEND"}
+)
+PIE_LEGEND_POSITIONS = BASIC_LEGEND_POSITIONS | {"LABELED_LEGEND"}
+DEFAULT_CHART_WIDTH_PX = 600
+DEFAULT_CHART_HEIGHT_PX = 371
+
+
+def _normalize_chart_type(chart_type: Optional[str]) -> str:
+    normalized = (chart_type or "").strip().upper()
+    if normalized not in CHART_TYPES:
+        raise UserInputError(f"chart_type must be one of {', '.join(CHART_TYPES)}.")
+    return normalized
+
+
+def _normalize_legend_position(
+    legend_position: Optional[str], pie: bool
+) -> Optional[str]:
+    """Accept 'BOTTOM' or 'BOTTOM_LEGEND' (case-insensitive); None passes through."""
+    if legend_position is None:
+        return None
+    normalized = legend_position.strip().upper()
+    if not normalized.endswith("_LEGEND"):
+        normalized = f"{normalized}_LEGEND"
+    if normalized == "NONE_LEGEND":
+        normalized = "NO_LEGEND"
+    allowed = PIE_LEGEND_POSITIONS if pie else BASIC_LEGEND_POSITIONS
+    if normalized not in allowed:
+        raise UserInputError(f"legend_position must be one of {sorted(allowed)}.")
+    return normalized
+
+
+def _chart_data(grid_range: dict) -> dict:
+    return {"sourceRange": {"sources": [grid_range]}}
+
+
+def _build_chart_spec(
+    chart_type: str,
+    title: Optional[str],
+    subtitle: Optional[str],
+    domain_grid: dict,
+    series_grids: List[dict],
+    legend_position: Optional[str],
+    header_count: Optional[int],
+) -> dict:
+    """Build a ChartSpec for a basic chart (BAR/COLUMN/LINE/AREA/SCATTER) or a PIE chart."""
+    normalized = _normalize_chart_type(chart_type)
+    if not series_grids:
+        raise UserInputError("series_ranges must contain at least one range.")
+    spec: dict = {}
+    if title is not None:
+        spec["title"] = title
+    if subtitle is not None:
+        spec["subtitle"] = subtitle
+
+    if normalized == "PIE":
+        if len(series_grids) != 1:
+            raise UserInputError("A PIE chart takes exactly one series range.")
+        pie: dict = {
+            "domain": _chart_data(domain_grid),
+            "series": _chart_data(series_grids[0]),
+        }
+        legend = _normalize_legend_position(legend_position, pie=True)
+        if legend:
+            pie["legendPosition"] = legend
+        spec["pieChart"] = pie
+        return spec
+
+    basic: dict = {
+        "chartType": normalized,
+        "domains": [{"domain": _chart_data(domain_grid)}],
+        "series": [
+            {"series": _chart_data(grid), "targetAxis": "LEFT_AXIS"}
+            for grid in series_grids
+        ],
+    }
+    if normalized == "BAR":
+        for entry in basic["series"]:
+            entry["targetAxis"] = "BOTTOM_AXIS"
+    legend = _normalize_legend_position(legend_position, pie=False)
+    if legend:
+        basic["legendPosition"] = legend
+    if header_count is not None:
+        if isinstance(header_count, bool) or header_count < 0:
+            raise UserInputError("header_count must be a non-negative integer.")
+        basic["headerCount"] = header_count
+    spec["basicChart"] = basic
+    return spec
+
+
+def _build_overlay_position(
+    anchor: dict, width: Optional[int], height: Optional[int]
+) -> dict:
+    """OverlayPosition from a GridCoordinate anchor plus optional pixel size."""
+    for name, value in (("width", width), ("height", height)):
+        if value is not None and (isinstance(value, bool) or value <= 0):
+            raise UserInputError(f"{name} must be a positive number of pixels.")
+    overlay: dict = {"anchorCell": anchor}
+    if width is not None:
+        overlay["widthPixels"] = width
+    if height is not None:
+        overlay["heightPixels"] = height
+    return overlay
+
+
+def _build_chart_position(
+    anchor: Optional[dict], width: Optional[int], height: Optional[int]
+) -> dict:
+    """EmbeddedObjectPosition: anchored overlay when a cell is given, else a new sheet."""
+    if anchor is None:
+        return {"newSheet": True}
+    return {
+        "overlayPosition": _build_overlay_position(
+            anchor,
+            width if width is not None else DEFAULT_CHART_WIDTH_PX,
+            height if height is not None else DEFAULT_CHART_HEIGHT_PX,
+        )
+    }
+
+
+def _build_embedded_object_position_update(
+    object_id: int, anchor: Optional[dict], width: Optional[int], height: Optional[int]
+) -> dict:
+    """updateEmbeddedObjectPosition touching only the supplied overlay fields."""
+    fields: List[str] = []
+    if anchor is not None:
+        fields.append("anchorCell")
+    if width is not None:
+        fields.append("widthPixels")
+    if height is not None:
+        fields.append("heightPixels")
+    if not fields:
+        raise UserInputError(
+            "action='move' needs anchor_cell and/or width/height to change."
+        )
+    overlay = _build_overlay_position(anchor or {}, width, height)
+    if anchor is None:
+        overlay.pop("anchorCell", None)
+    return {
+        "updateEmbeddedObjectPosition": {
+            "objectId": object_id,
+            "newPosition": {"overlayPosition": overlay},
+            "fields": ",".join(fields),
+        }
+    }
+
+
+def _chart_type_of(spec: dict) -> str:
+    """Human label for a ChartSpec's chart kind."""
+    if "basicChart" in spec:
+        return (spec["basicChart"] or {}).get("chartType", "BASIC")
+    for key in spec:
+        if key.endswith("Chart"):
+            return key[: -len("Chart")].upper()
+    return "UNKNOWN"
+
+
+def _find_chart(sheets: List[dict], chart_id: int) -> dict:
+    """Locate an EmbeddedChart by chartId across all sheets."""
+    for sheet in sheets:
+        for chart in sheet.get("charts") or []:
+            if chart.get("chartId") == chart_id:
+                return chart
+    raise UserInputError(f"No chart with chart_id {chart_id} in this spreadsheet.")
+
+
+def _describe_chart_position(position: dict, sheet_titles: dict[int, str]) -> str:
+    overlay = position.get("overlayPosition")
+    if overlay:
+        anchor = overlay.get("anchorCell", {}) or {}
+        title = sheet_titles.get(
+            anchor.get("sheetId"), f"Sheet {anchor.get('sheetId')}"
+        )
+        cell = _format_a1_cell(
+            title, anchor.get("rowIndex", 0), anchor.get("columnIndex", 0)
+        )
+        size = ""
+        if overlay.get("widthPixels") or overlay.get("heightPixels"):
+            size = f", {overlay.get('widthPixels', '?')}x{overlay.get('heightPixels', '?')}px"
+        return f"anchored at {cell}{size}"
+    if position.get("sheetId") is not None:
+        title = sheet_titles.get(position["sheetId"], f"Sheet {position['sheetId']}")
+        return f"own sheet '{title}'"
+    return "position unknown"
+
+
+def _format_charts_list(sheets: List[dict], sheet_titles: dict[int, str]) -> str:
+    """List every embedded chart with id, title, type and placement."""
+    lines: List[str] = []
+    for sheet in sheets:
+        charts = sheet.get("charts") or []
+        if not charts:
+            continue
+        props = sheet.get("properties", {}) or {}
+        lines.append(f"Sheet '{props.get('title', 'Untitled')}':")
+        for chart in charts:
+            spec = chart.get("spec", {}) or {}
+            lines.append(
+                f"  Chart {chart.get('chartId')}: '{spec.get('title', '')}' "
+                f"[{_chart_type_of(spec)}] "
+                f"{_describe_chart_position(chart.get('position', {}) or {}, sheet_titles)}"
+            )
+    return "\n".join(lines) if lines else "No charts found."
+
+
+def _apply_chart_spec_updates(
+    spec: dict,
+    title: Optional[str],
+    subtitle: Optional[str],
+    chart_type: Optional[str],
+    legend_position: Optional[str],
+) -> dict:
+    """Copy a ChartSpec and apply the supplied title/subtitle/type/legend changes."""
+    updated = copy.deepcopy(spec)
+    changed = False
+    if title is not None:
+        updated["title"] = title
+        changed = True
+    if subtitle is not None:
+        updated["subtitle"] = subtitle
+        changed = True
+    is_pie = "pieChart" in updated
+    if chart_type is not None:
+        normalized = _normalize_chart_type(chart_type)
+        if is_pie or normalized == "PIE" or "basicChart" not in updated:
+            raise UserInputError(
+                "chart_type can only switch between BAR, COLUMN, LINE, AREA and SCATTER "
+                "on an existing basic chart. Delete and re-add the chart to change to "
+                "or from PIE."
+            )
+        updated["basicChart"]["chartType"] = normalized
+        changed = True
+    if legend_position is not None:
+        legend = _normalize_legend_position(legend_position, pie=is_pie)
+        target_key = "pieChart" if is_pie else "basicChart"
+        if target_key not in updated:
+            raise UserInputError(
+                "legend_position is only supported on basic and pie charts."
+            )
+        updated[target_key]["legendPosition"] = legend
+        changed = True
+    if not changed:
+        raise UserInputError(
+            "action='update' needs at least one of title, subtitle, chart_type or "
+            "legend_position."
+        )
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# find_replace_sheet
+# ---------------------------------------------------------------------------
+
+
+def _build_find_replace_request(
+    find: str,
+    replacement: str,
+    scope: dict,
+    match_case: bool,
+    match_entire_cell: bool,
+    search_by_regex: bool,
+    include_formulas: bool,
+) -> dict:
+    """Build a findReplace request; `scope` is {range}, {sheetId} or {allSheets}."""
+    if find is None or find == "":
+        raise UserInputError("find must be a non-empty string.")
+    if search_by_regex:
+        try:
+            re.compile(find)
+        except re.error as exc:
+            raise UserInputError(
+                f"find is not a valid regular expression: {exc}"
+            ) from exc
+    body: dict = {
+        "find": find,
+        "replacement": replacement if replacement is not None else "",
+        "matchCase": bool(match_case),
+        "matchEntireCell": bool(match_entire_cell),
+        "searchByRegex": bool(search_by_regex),
+        "includeFormulas": bool(include_formulas),
+    }
+    body.update(scope)
+    return {"findReplace": body}
+
+
+def _format_find_replace_reply(reply: dict) -> str:
+    """Summarize a FindReplaceResponse."""
+    reply = reply or {}
+    return (
+        f"{reply.get('occurrencesChanged', 0)} occurrence(s) changed across "
+        f"{reply.get('valuesChanged', 0)} value cell(s) and "
+        f"{reply.get('formulasChanged', 0)} formula cell(s) in "
+        f"{reply.get('rowsChanged', 0)} row(s) on {reply.get('sheetsChanged', 0)} sheet(s)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# read_sheet_values: multi-range (batchGet) formatting
+# ---------------------------------------------------------------------------
+
+
+def _format_rows(values: List[List[Any]]) -> List[str]:
+    """Render rows as 'Row  n: [...]' lines, padding short rows to the first row's width."""
+    lines: List[str] = []
+    width = len(values[0]) if values else 0
+    for i, row in enumerate(values, 1):
+        padded = row + [""] * max(0, width - len(row))
+        lines.append(f"Row {i:2d}: {padded}")
+    return lines
+
+
+def _format_value_range_block(
+    index: int, requested_range: str, value_range: dict, clamp_note: Optional[str]
+) -> str:
+    """Format one ValueRange from values.batchGet as a titled block."""
+    values = value_range.get("values", []) or []
+    resolved = value_range.get("range", requested_range)
+    header = f"Range {index} '{requested_range}'"
+    if resolved != requested_range:
+        header += f" (resolved to '{resolved}')"
+    if not values:
+        block = f"{header}: no data found."
+    else:
+        block = f"{header}: {len(values)} rows\n" + "\n".join(_format_rows(values))
+    if clamp_note:
+        block += clamp_note
+    return block
