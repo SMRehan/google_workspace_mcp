@@ -166,7 +166,32 @@ def test_serialize_oauth_state_preserves_missing_enforcement_marker(tmp_path):
     assert "enforce_user_email_match" not in serialized
 
 
-def test_store_session_rejects_mcp_session_rebind_by_default(tmp_path):
+@pytest.fixture
+def oauth21_mode(monkeypatch):
+    """Enable OAuth 2.1 mode, where MCP session binding is enforced."""
+    from auth.oauth_config import reload_oauth_config
+
+    monkeypatch.setenv("MCP_ENABLE_OAUTH21", "true")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "test-client-id")
+    monkeypatch.delenv("MCP_SINGLE_USER_MODE", raising=False)
+    reload_oauth_config()
+    yield
+
+
+@pytest.fixture
+def legacy_mode(monkeypatch):
+    """OAuth 2.1 off: the local multi-account (legacy OAuth 2.0) deployment."""
+    from auth.oauth_config import reload_oauth_config
+
+    monkeypatch.delenv("MCP_ENABLE_OAUTH21", raising=False)
+    monkeypatch.delenv("MCP_SINGLE_USER_MODE", raising=False)
+    reload_oauth_config()
+    yield
+
+
+def test_store_session_rejects_mcp_session_rebind_in_oauth21_mode(
+    tmp_path, oauth21_mode
+):
     state_file = tmp_path / "oauth_states.json"
     store = OAuth21SessionStore(oauth_state_file=str(state_file))
 
@@ -184,7 +209,7 @@ def test_store_session_rejects_mcp_session_rebind_by_default(tmp_path):
         )
 
 
-def test_store_session_stays_bounded_for_sessionless_clients(tmp_path):
+def test_store_session_stays_bounded_for_sessionless_clients(tmp_path, oauth21_mode):
     # Sessionless (2026-07-28) clients get a fresh MCP session ID per request.
     store = OAuth21SessionStore(oauth_state_file=str(tmp_path / "oauth_states.json"))
 
@@ -432,3 +457,30 @@ async def test_ensure_session_falls_back_to_non_refreshable_credential(monkeypat
     assert creds is not None
     assert creds.token == "ya29.direct"
     assert creds.refresh_token is None
+
+
+def test_legacy_mode_allows_one_session_to_store_several_accounts(
+    tmp_path, legacy_mode
+):
+    # One long-lived HTTP client uses account A, then refreshes account B's token.
+    store = OAuth21SessionStore(oauth_state_file=str(tmp_path / "oauth_states.json"))
+
+    store.store_session(
+        user_email="account-a@example.com",
+        access_token="token-a",
+        mcp_session_id="session-123",
+    )
+    store.store_session(
+        user_email="account-b@example.com",
+        access_token="token-b-refreshed",
+        mcp_session_id="session-123",
+    )
+    store.store_session(
+        user_email="account-a@example.com",
+        access_token="token-a-refreshed",
+        mcp_session_id="session-123",
+    )
+
+    assert "session-123" not in store._session_auth_binding
+    assert store.get_credentials("account-b@example.com").token == "token-b-refreshed"
+    assert store.get_credentials("account-a@example.com").token == "token-a-refreshed"

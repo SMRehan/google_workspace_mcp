@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - Windows
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import get_http_headers
 from google.oauth2.credentials import Credentials
-from auth.oauth_config import is_external_oauth21_provider
+from auth.oauth_config import is_external_oauth21_provider, is_oauth21_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -629,6 +629,16 @@ class OAuth21SessionStore:
         # turns a successful token refresh for a second account into a false
         # "rebind" error.
         if os.getenv("MCP_SINGLE_USER_MODE") == "1":
+            mcp_session_id = None
+        # Legacy OAuth 2.0 mode (OAuth 2.1 off) is a single-operator deployment:
+        # one person's stored logins, selected per call by user_google_email.
+        # get_credentials already loads the requested user's credentials from the
+        # credential store when the session maps to someone else, so the binding
+        # protects nothing here. Enforcing it only makes a successful refresh of
+        # a second account's token fail with a false "rebind" error once the
+        # same long-lived MCP session (e.g. one HTTP client) has used another
+        # account. Keep the binding where it isolates users: OAuth 2.1 mode.
+        elif not is_oauth21_enabled():
             mcp_session_id = None
 
         with self._lock:
