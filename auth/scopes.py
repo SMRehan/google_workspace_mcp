@@ -49,6 +49,14 @@ CHAT_MEMBERSHIPS_READONLY_SCOPE = (
 )
 CHAT_MEMBERSHIPS_SCOPE = "https://www.googleapis.com/auth/chat.memberships"
 CHAT_DELETE_SCOPE = "https://www.googleapis.com/auth/chat.delete"
+# Per-user read state: `is_unread()` in messages.search, get/updateSpaceReadState,
+# getThreadReadState. The full scope also marks spaces read.
+CHAT_READSTATE_SCOPE = "https://www.googleapis.com/auth/chat.users.readstate"
+CHAT_READSTATE_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/chat.users.readstate.readonly"
+)
+# Per-user space notification settings (mute level) via spaceNotificationSetting.
+CHAT_SPACESETTINGS_SCOPE = "https://www.googleapis.com/auth/chat.users.spacesettings"
 
 # Google Sheets API scopes
 SHEETS_READONLY_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
@@ -125,6 +133,7 @@ SCOPE_HIERARCHY = {
     CHAT_WRITE_SCOPE: {CHAT_READONLY_SCOPE},
     CHAT_SPACES_SCOPE: {CHAT_SPACES_READONLY_SCOPE},
     CHAT_MEMBERSHIPS_SCOPE: {CHAT_MEMBERSHIPS_READONLY_SCOPE},
+    CHAT_READSTATE_SCOPE: {CHAT_READSTATE_READONLY_SCOPE},
     FORMS_BODY_SCOPE: {FORMS_BODY_READONLY_SCOPE},
     SCRIPT_PROJECTS_SCOPE: {SCRIPT_PROJECTS_READONLY_SCOPE},
     SCRIPT_DEPLOYMENTS_SCOPE: {SCRIPT_DEPLOYMENTS_READONLY_SCOPE},
@@ -188,6 +197,8 @@ CHAT_SCOPES = [
     CHAT_MEMBERSHIPS_READONLY_SCOPE,  # Names DMs after their members
     CHAT_MEMBERSHIPS_SCOPE,  # manage_chat_member add/update_role/remove
     CHAT_DELETE_SCOPE,  # manage_chat_space delete
+    CHAT_READSTATE_SCOPE,  # unread messages (is_unread()), read positions, mark read
+    CHAT_SPACESETTINGS_SCOPE,  # per-space notification/mute settings
     CONTACTS_READONLY_SCOPE,  # Resolves sender and member names via People API
 ]
 
@@ -269,6 +280,7 @@ TOOL_READONLY_SCOPES_MAP = {
         CHAT_READONLY_SCOPE,
         CHAT_SPACES_READONLY_SCOPE,
         CHAT_MEMBERSHIPS_READONLY_SCOPE,
+        CHAT_READSTATE_READONLY_SCOPE,
         CONTACTS_READONLY_SCOPE,
     ],
     "forms": [FORMS_BODY_READONLY_SCOPE, FORMS_RESPONSES_READONLY_SCOPE],
