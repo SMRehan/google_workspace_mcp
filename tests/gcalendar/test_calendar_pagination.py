@@ -65,6 +65,31 @@ async def test_list_calendars_forwards_page_token():
 
 
 @pytest.mark.asyncio
+async def test_list_calendars_reports_time_zone():
+    service = _calendar_list_service(
+        {
+            "items": [
+                {
+                    "id": "cal1",
+                    "summary": "Work",
+                    "primary": True,
+                    "timeZone": "Europe/Amsterdam",
+                },
+                {"id": "cal2", "summary": "Shared"},
+            ]
+        }
+    )
+
+    result = await _unwrap(calendar_tools.list_calendars)(
+        service=service, user_google_email="user@example.com"
+    )
+
+    assert '- "Work" (Primary) (ID: cal1) [tz: Europe/Amsterdam]' in result
+    assert '- "Shared" (ID: cal2)\n' in result + "\n"
+    assert result.count("tz:") == 1
+
+
+@pytest.mark.asyncio
 async def test_get_events_reports_next_page_token():
     service = _events_service(
         {

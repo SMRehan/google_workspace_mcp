@@ -11,27 +11,87 @@
         "description": "ID of the document to update"
       },
       "start_index": {
-        "type": "integer",
-        "description": "Start position for operation using Docs API indices from\ninspect_doc_structure. For the main body, 0 is also accepted as an\nalias for the first writable position."
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Start position for operation using Docs API indices from\ninspect_doc_structure. For the main body, 0 is also accepted as an\nalias for the first writable position. Required unless heading is set."
       },
       "end_index": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "integer",
         "description": "End position for text replacement/formatting (if not provided with text, text is inserted)"
       },
       "text": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "string",
-        "description": "New text to insert or replace with (optional - can format existing text without changing it)"
+        "description": "New text to insert or replace with (optional - can format existing text without changing it).\nRendered as Markdown when heading is set."
+      },
+      "heading": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Text of a body heading (case-insensitive, must match exactly one) whose\nsection to edit instead of start_index/end_index"
+      },
+      "heading_level": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Optional 1-6 heading level to narrow the heading match"
       },
       "tab_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "string",
-        "description": "Optional document tab ID to target"
+        "description": "Optional document tab ID to target (required with heading when the doc has multiple tabs)"
       },
       "segment_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "string",
         "description": "Optional header/footer/footnote segment ID to target"
       },
       "end_of_segment": {
@@ -40,84 +100,170 @@
         "description": "Insert text at the end of the targeted segment instead of start_index"
       },
       "bold": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "boolean",
         "description": "Whether to make text bold (True/False/None to leave unchanged)"
       },
       "italic": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "boolean",
         "description": "Whether to make text italic (True/False/None to leave unchanged)"
       },
       "underline": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "boolean",
         "description": "Whether to underline text (True/False/None to leave unchanged)"
       },
       "strikethrough": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "boolean",
         "description": "Whether to strike through text (True/False/None to leave unchanged)"
       },
       "font_size": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "number",
         "description": "Font size in points"
       },
       "font_family": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "string",
         "description": "Font family name (e.g., \"Arial\", \"Times New Roman\")"
       },
       "font_weight": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "integer",
         "description": "Font weight (100-900 in steps of 100; requires font_family)"
       },
       "text_color": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "string",
         "description": "Foreground text color (#RRGGBB)"
       },
       "background_color": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "string",
         "description": "Background/highlight color (#RRGGBB)"
       },
       "link_url": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "string",
         "description": "Hyperlink URL (http/https)"
       },
       "clear_link": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "boolean",
         "description": "Remove hyperlink from the target range"
       },
       "baseline_offset": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "string",
         "description": "One of NONE, SUPERSCRIPT, SUBSCRIPT"
       },
       "small_caps": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
         "default": null,
-        "type": "boolean",
         "description": "Whether to apply small caps"
       },
       "write_mode": {
         "default": "EDIT",
-        "enum": [
-          "EDIT",
-          "SUGGEST"
-        ],
         "type": "string",
-        "description": "\"EDIT\" (default) applies the change directly; \"SUGGEST\"\nrecords it as a tracked suggestion that collaborators accept or\nreject (sent as writeControl.writeMode)."
+        "description": "\"EDIT\" (default) applies the change directly; \"SUGGEST\"\nrecords it as a suggested edit that collaborators can accept or reject"
       }
     },
     "required": [
       "user_google_email",
-      "document_id",
-      "start_index"
+      "document_id"
     ],
     "type": "object"
   },
@@ -1092,7 +1238,8 @@
             "type": "string"
           },
           "date": {
-            "description": "ISO 8601 date ('2026-10-08') or datetime ('2026-10-08T15:00:00Z'). A bare date is midnight UTC; a naive datetime is treated as UTC.",
+            "description": "YYYY-MM-DD, or an ISO 8601 timestamp with an offset (displayed in UTC unless timezone is set).",
+            "minLength": 1,
             "type": "string"
           },
           "date_format": {
@@ -1111,7 +1258,7 @@
               }
             ],
             "default": null,
-            "description": "Display format; the API default is DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED."
+            "description": "Defaults to DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED."
           },
           "time_format": {
             "anyOf": [
@@ -1128,9 +1275,9 @@
               }
             ],
             "default": null,
-            "description": "Time display; the API default is TIME_FORMAT_DISABLED."
+            "description": "Omit to show no time."
           },
-          "time_zone_id": {
+          "timezone": {
             "anyOf": [
               {
                 "type": "string"
@@ -1140,19 +1287,7 @@
               }
             ],
             "default": null,
-            "description": "CLDR time zone such as 'America/New_York' used to display the date."
-          },
-          "locale": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "description": "Language code such as 'en' for the display text."
+            "description": "IANA time zone ID shown on the chip. Requires time_format TIME_FORMAT_HOUR_MINUTE_TIMEZONE."
           }
         },
         "required": [
@@ -1616,20 +1751,9 @@
             "type": "string"
           },
           "email": {
-            "description": "Email address the person chip links to.",
+            "description": "Email of the person to @mention as a smart chip.",
+            "minLength": 1,
             "type": "string"
-          },
-          "name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "description": "Display name shown in the chip instead of the email address."
           }
         },
         "required": [
@@ -3898,6 +4022,12 @@
               "$ref": "#/$defs/InsertImageOperation"
             },
             {
+              "$ref": "#/$defs/InsertPersonOperation"
+            },
+            {
+              "$ref": "#/$defs/InsertDateOperation"
+            },
+            {
               "$ref": "#/$defs/InsertDocTabOperation"
             },
             {
@@ -3905,12 +4035,6 @@
             },
             {
               "$ref": "#/$defs/UpdateDocTabOperation"
-            },
-            {
-              "$ref": "#/$defs/InsertPersonOperation"
-            },
-            {
-              "$ref": "#/$defs/InsertDateOperation"
             },
             {
               "$ref": "#/$defs/InsertRichLinkOperation"
@@ -3946,12 +4070,8 @@
       },
       "write_mode": {
         "default": "EDIT",
-        "enum": [
-          "EDIT",
-          "SUGGEST"
-        ],
         "type": "string",
-        "description": "\"EDIT\" (default) applies every operation directly. \"SUGGEST\"\n        records the whole batch as tracked suggestions (Docs\n        writeControl.writeMode) that collaborators can accept or\n        reject with manage_doc_suggestions."
+        "description": "\"EDIT\" (default) applies the batch directly; \"SUGGEST\" records\n        every operation as a suggested edit that collaborators can accept\n        or reject (see manage_doc_suggestions). The Docs API rejects some\n        operations in SUGGEST mode, such as named range and tab changes."
       }
     },
     "required": [

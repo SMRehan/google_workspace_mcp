@@ -7,8 +7,9 @@ to simplify the implementation of document editing tools.
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone as dt_timezone
 from typing import Dict, Any, Optional, List
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,11 @@ VALID_SUGGESTIONS_VIEW_MODES = (
     "SUGGESTIONS_INLINE",
     "PREVIEW_SUGGESTIONS_ACCEPTED",
     "PREVIEW_WITHOUT_SUGGESTIONS",
+)
+
+VALID_WRITE_MODES = (
+    "EDIT",
+    "SUGGEST",
 )
 
 VALID_TEXT_BASELINE_OFFSETS = (
@@ -108,18 +114,6 @@ VALID_BULLET_PRESETS = (
     "NUMBERED_ZERODECIMAL_ALPHA_ROMAN",
 )
 
-VALID_WRITE_MODES = (
-    "EDIT",
-    "SUGGEST",
-)
-
-VALID_DATE_FORMATS = (
-    "DATE_FORMAT_MONTH_DAY_ABBREVIATED",
-    "DATE_FORMAT_MONTH_DAY_FULL",
-    "DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED",
-    "DATE_FORMAT_ISO8601",
-)
-
 VALID_IMAGE_REPLACE_METHODS = ("CENTER_CROP",)
 
 # Docs API constraints on caller-supplied dropdown IDs.
@@ -127,35 +121,6 @@ DROPDOWN_DEFINITION_ID_PATTERN = re.compile(r"^kix\.[a-zA-Z0-9_-]{2,14}$")
 DROPDOWN_OPTION_ID_PATTERN = re.compile(r"^dropdownItem\.[a-zA-Z0-9_-]{2,14}$")
 DROPDOWN_MIN_OPTIONS = 2
 DROPDOWN_MAX_OPTIONS = 50
-
-
-def validate_write_mode(write_mode: str) -> str:
-    """Return the normalized write mode, raising ValueError when it is unsupported."""
-    if not isinstance(write_mode, str):
-        raise ValueError(
-            f"write_mode must be one of {', '.join(VALID_WRITE_MODES)}, got {write_mode!r}"
-        )
-    normalized = write_mode.strip().upper()
-    if normalized not in VALID_WRITE_MODES:
-        raise ValueError(
-            f"write_mode must be one of {', '.join(VALID_WRITE_MODES)}, got '{write_mode}'"
-        )
-    return normalized
-
-
-def build_batch_update_body(
-    requests: List[Dict[str, Any]], write_mode: str = "EDIT"
-) -> Dict[str, Any]:
-    """
-    Build the documents.batchUpdate body for a list of requests.
-
-    writeControl is only attached for SUGGEST so an EDIT body is byte-for-byte
-    what the tools sent before write modes existed.
-    """
-    body: Dict[str, Any] = {"requests": requests}
-    if validate_write_mode(write_mode) == "SUGGEST":
-        body["writeControl"] = {"writeMode": "SUGGEST"}
-    return body
 
 
 def validate_suggestions_view_mode(suggestions_view_mode: str) -> Optional[str]:
@@ -166,6 +131,42 @@ def validate_suggestions_view_mode(suggestions_view_mode: str) -> Optional[str]:
     return (
         "Error: suggestions_view_mode must be one of "
         f"{', '.join(VALID_SUGGESTIONS_VIEW_MODES)}, got '{suggestions_view_mode}'"
+    )
+
+
+def validate_write_mode(write_mode: str) -> Optional[str]:
+    """Return an error message when write_mode is invalid."""
+    if write_mode in VALID_WRITE_MODES:
+        return None
+
+    return (
+        "Error: write_mode must be one of "
+        f"{', '.join(VALID_WRITE_MODES)}, got '{write_mode}'"
+    )
+
+
+def build_batch_update_body(
+    requests: List[Dict[str, Any]], write_mode: str = "EDIT"
+) -> Dict[str, Any]:
+    """Build a documents.batchUpdate body; SUGGEST records requests as suggestions."""
+    body: Dict[str, Any] = {"requests": requests}
+    if write_mode == "SUGGEST":
+        body["writeControl"] = {"writeMode": "SUGGEST"}
+    return body
+
+
+def suggestion_save_error(result: Dict[str, Any], write_mode: str) -> Optional[str]:
+    """Return an error when Docs reports a SUGGEST batch failed to save."""
+    if write_mode != "SUGGEST":
+        return None
+    if result.get("commentUpdateState") != "ALL_FAILED_UNKNOWN_REASON":
+        return None
+
+    return (
+        "Google Docs did not save these changes as suggestions "
+        "(commentUpdateState=ALL_FAILED_UNKNOWN_REASON). The document may have "
+        "been edited directly; check its version history before retrying, since "
+        "retrying could duplicate the change."
     )
 
 
@@ -1334,6 +1335,66 @@ def create_insert_image_request(
     return request
 
 
+def create_insert_person_request(
+    index: Optional[int],
+    email: str,
+    tab_id: Optional[str] = None,
+    segment_id: Optional[str] = None,
+    end_of_segment: bool = False,
+) -> Dict[str, Any]:
+    """Create an insertPerson request that adds a person smart chip for ``email``."""
+    return {
+        "insertPerson": {
+            "personProperties": {"email": email},
+            **_build_location(
+                index=index,
+                tab_id=tab_id,
+                segment_id=segment_id,
+                end_of_segment=end_of_segment,
+            ),
+        }
+    }
+
+
+def create_insert_date_request(
+    index: Optional[int],
+    date: str,
+    date_format: Optional[str] = None,
+    time_format: Optional[str] = None,
+    timezone: Optional[str] = None,
+    tab_id: Optional[str] = None,
+    segment_id: Optional[str] = None,
+    end_of_segment: bool = False,
+) -> Dict[str, Any]:
+    """Create an insertDate request; a date-only value is sent as noon in ``timezone`` or UTC."""
+    moment = datetime.fromisoformat(date.replace("Z", "+00:00"))
+    if "T" not in date:
+        moment = moment.replace(
+            hour=12, tzinfo=ZoneInfo(timezone) if timezone else dt_timezone.utc
+        )
+    props: Dict[str, Any] = {
+        "timestamp": moment.astimezone(dt_timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "dateFormat": date_format or "DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED",
+    }
+    if time_format:
+        props["timeFormat"] = time_format
+    if timezone:
+        props["timeZoneId"] = timezone
+    return {
+        "insertDate": {
+            "dateElementProperties": props,
+            **_build_location(
+                index=index,
+                tab_id=tab_id,
+                segment_id=segment_id,
+                end_of_segment=end_of_segment,
+            ),
+        }
+    }
+
+
 def create_bullet_list_request(
     start_index: int,
     end_index: int,
@@ -1907,127 +1968,6 @@ def create_pin_table_header_rows_request(
     }
 
 
-def create_insert_person_request(
-    index: Optional[int],
-    email: str,
-    name: Optional[str] = None,
-    tab_id: Optional[str] = None,
-    segment_id: Optional[str] = None,
-    end_of_segment: bool = False,
-) -> Dict[str, Any]:
-    """
-    Create an insertPerson request (a person smart chip).
-
-    Args:
-        index: Position to insert the chip; must fall inside an existing paragraph.
-        email: Email address linked to the person chip.
-        name: Optional display name shown instead of the email address.
-        tab_id: Optional ID of the tab to target.
-        segment_id: Optional header/footer/footnote segment ID.
-        end_of_segment: Append to the end of the segment instead of using index.
-
-    Reference:
-        https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#InsertPersonRequest
-    """
-    if not email or not isinstance(email, str) or "@" not in email:
-        raise ValueError("email must be a valid email address")
-
-    person_properties: Dict[str, Any] = {"email": email}
-    if name:
-        person_properties["name"] = name
-
-    request: Dict[str, Any] = {"insertPerson": {"personProperties": person_properties}}
-    request["insertPerson"].update(
-        _build_location(
-            index=index,
-            tab_id=tab_id,
-            segment_id=segment_id,
-            end_of_segment=end_of_segment,
-        )
-    )
-    return request
-
-
-def iso_date_to_rfc3339(date: str) -> str:
-    """
-    Convert an ISO 8601 date or datetime into the RFC 3339 UTC form the Docs API wants.
-
-    A bare date ("2026-10-08") becomes midnight UTC. A naive datetime is treated
-    as UTC; an offset-aware one is converted to UTC.
-    """
-    if not isinstance(date, str) or not date.strip():
-        raise ValueError("date must be an ISO 8601 date such as '2026-10-08'")
-    raw = date.strip()
-    if raw.endswith("Z") or raw.endswith("z"):
-        raw = raw[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        raise ValueError(
-            f"date must be an ISO 8601 date or datetime, got '{date}'"
-        ) from None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def create_insert_date_request(
-    index: Optional[int],
-    date: str,
-    date_format: Optional[str] = None,
-    time_format: Optional[str] = None,
-    time_zone_id: Optional[str] = None,
-    locale: Optional[str] = None,
-    tab_id: Optional[str] = None,
-    segment_id: Optional[str] = None,
-    end_of_segment: bool = False,
-) -> Dict[str, Any]:
-    """
-    Create an insertDate request (a date smart chip).
-
-    Args:
-        index: Position to insert the chip; must fall inside an existing paragraph.
-        date: ISO 8601 date or datetime to represent.
-        date_format: One of VALID_DATE_FORMATS; the API default is
-            DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED.
-        time_format: TIME_FORMAT_DISABLED (default), TIME_FORMAT_HOUR_MINUTE or
-            TIME_FORMAT_HOUR_MINUTE_TIMEZONE.
-        time_zone_id: CLDR time zone such as "America/New_York".
-        locale: Language code such as "en".
-        tab_id: Optional ID of the tab to target.
-        segment_id: Optional header/footer segment ID.
-        end_of_segment: Append to the end of the segment instead of using index.
-
-    Reference:
-        https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#InsertDateRequest
-    """
-    properties: Dict[str, Any] = {"timestamp": iso_date_to_rfc3339(date)}
-    if date_format is not None:
-        normalized = str(date_format).strip().upper()
-        if normalized not in VALID_DATE_FORMATS:
-            raise ValueError(
-                f"date_format must be one of: {', '.join(VALID_DATE_FORMATS)}"
-            )
-        properties["dateFormat"] = normalized
-    if time_format is not None:
-        properties["timeFormat"] = str(time_format).strip().upper()
-    if time_zone_id:
-        properties["timeZoneId"] = time_zone_id
-    if locale:
-        properties["locale"] = locale
-
-    request: Dict[str, Any] = {"insertDate": {"dateElementProperties": properties}}
-    request["insertDate"].update(
-        _build_location(
-            index=index,
-            tab_id=tab_id,
-            segment_id=segment_id,
-            end_of_segment=end_of_segment,
-        )
-    )
-    return request
-
-
 def create_insert_rich_link_request(
     index: Optional[int],
     uri: str,
@@ -2441,6 +2381,8 @@ def validate_operation(operation: Dict[str, Any]) -> tuple[bool, str]:
         "update_section_style": ["start_index", "end_index"],
         "create_header_footer": ["section_type"],
         "insert_image": ["image_uri"],
+        "insert_person": ["email"],
+        "insert_date": ["date"],
         "insert_doc_tab": ["title", "index"],
         "delete_doc_tab": ["tab_id"],
         "update_doc_tab": ["tab_id", "title"],
@@ -2465,8 +2407,6 @@ def validate_operation(operation: Dict[str, Any]) -> tuple[bool, str]:
         "update_table_column_properties": ["table_start_index", "column_indices"],
         "update_table_row_style": ["table_start_index", "row_indices"],
         "pin_table_header_rows": ["table_start_index", "pinned_header_rows_count"],
-        "insert_person": ["email"],
-        "insert_date": ["date"],
         "insert_rich_link": ["uri"],
         "create_footnote": [],
         "create_dropdown_definition": ["options"],

@@ -15,6 +15,8 @@ from gdocs.docs_anchors import (
 )
 from gdocs.docs_helpers import (
     utf16_length,
+    build_batch_update_body,
+    suggestion_save_error,
     create_insert_text_request,
     create_delete_range_request,
     create_format_text_request,
@@ -25,6 +27,8 @@ from gdocs.docs_helpers import (
     create_insert_page_break_request,
     create_insert_section_break_request,
     create_insert_image_request,
+    create_insert_person_request,
+    create_insert_date_request,
     create_bullet_list_request,
     create_delete_bullet_list_request,
     create_named_range_request,
@@ -45,8 +49,6 @@ from gdocs.docs_helpers import (
     create_update_table_column_properties_request,
     create_update_table_row_style_request,
     create_pin_table_header_rows_request,
-    create_insert_person_request,
-    create_insert_date_request,
     create_insert_rich_link_request,
     create_create_footnote_request,
     create_dropdown_definition_request,
@@ -56,7 +58,6 @@ from gdocs.docs_helpers import (
     create_delete_footer_request,
     create_delete_positioned_object_request,
     create_update_named_style_request,
-    build_batch_update_body,
     validate_write_mode,
     INSERTION_OPERATION_TYPES,
     validate_operation,
@@ -122,8 +123,8 @@ class BatchOperationManager:
         Args:
             document_id: ID of the document to update
             operations: List of operation dictionaries
-            write_mode: "EDIT" applies changes directly; "SUGGEST" records every
-                request as a tracked suggestion (writeControl.writeMode).
+            write_mode: "EDIT" applies the changes; "SUGGEST" records them as
+                suggested edits
 
         Returns:
             Tuple of (success, message, metadata)
@@ -138,10 +139,9 @@ class BatchOperationManager:
                 {},
             )
 
-        try:
-            write_mode = validate_write_mode(write_mode)
-        except ValueError as e:
-            return False, str(e), {}
+        write_mode_error = validate_write_mode(write_mode)
+        if write_mode_error:
+            return False, write_mode_error.removeprefix("Error: "), {}
 
         try:
             # Anchor resolution rewrites locations and order; leave caller data intact.
@@ -170,6 +170,10 @@ class BatchOperationManager:
             result = await self._execute_batch_requests(
                 document_id, requests, write_mode
             )
+
+            save_error = suggestion_save_error(result, write_mode)
+            if save_error:
+                return False, save_error, {}
 
             # Footnote text can only be written once the footnote's segment ID
             # exists, so it goes in a second batch keyed off the replies.
@@ -245,7 +249,7 @@ class BatchOperationManager:
             summary = self._build_operation_summary(operation_descriptions)
             msg = f"Successfully executed {len(operations)} operations ({summary})"
             if write_mode == "SUGGEST":
-                msg += " as tracked suggestions"
+                msg += " as suggested edits"
             if created_tabs:
                 tab_info = ", ".join(
                     f"'{t['title']}' (tab_id: {t['tab_id']})" for t in created_tabs
@@ -266,6 +270,15 @@ class BatchOperationManager:
                     for d in created_dropdowns
                 )
                 msg += f". Created dropdown definitions: {dropdown_info}"
+
+            replace_verb = (
+                "Suggested replacing" if write_mode == "SUGGEST" else "Replaced"
+            )
+            for request, reply in zip(requests, result.get("replies", [])):
+                if "replaceAllText" in request:
+                    count = reply.get("replaceAllText", {}).get("occurrencesChanged", 0)
+                    find_text = request["replaceAllText"]["containsText"]["text"]
+                    msg += f". {replace_verb} {count} occurrence(s) of '{find_text}'"
 
             return True, msg, metadata
 
@@ -1022,6 +1035,37 @@ class BatchOperationManager:
                 else f"insert image at {op.get('index')}"
             )
 
+        elif op_type == "insert_person":
+            request = create_insert_person_request(
+                op.get("index"),
+                op["email"],
+                tab_id,
+                segment_id=segment_id,
+                end_of_segment=end_of_segment,
+            )
+            description = (
+                f"mention {op['email']} at end of segment '{segment_id or 'body'}'"
+                if end_of_segment
+                else f"mention {op['email']} at {op.get('index')}"
+            )
+
+        elif op_type == "insert_date":
+            request = create_insert_date_request(
+                op.get("index"),
+                op["date"],
+                op.get("date_format"),
+                op.get("time_format"),
+                op.get("timezone"),
+                tab_id,
+                segment_id=segment_id,
+                end_of_segment=end_of_segment,
+            )
+            description = (
+                f"date chip {op['date']} at end of segment '{segment_id or 'body'}'"
+                if end_of_segment
+                else f"date chip {op['date']} at {op.get('index')}"
+            )
+
         elif op_type == "insert_doc_tab":
             request = create_insert_doc_tab_request(
                 op["title"], op["index"], op.get("parent_tab_id")
@@ -1153,39 +1197,6 @@ class BatchOperationManager:
                 f"for table at {op['table_start_index']}"
             )
 
-        elif op_type == "insert_person":
-            request = create_insert_person_request(
-                op.get("index"),
-                op["email"],
-                name=op.get("name"),
-                tab_id=tab_id,
-                segment_id=segment_id,
-                end_of_segment=end_of_segment,
-            )
-            description = (
-                f"insert person chip '{op['email']}' at end of segment '{segment_id or 'body'}'"
-                if end_of_segment
-                else f"insert person chip '{op['email']}' at {op.get('index')}"
-            )
-
-        elif op_type == "insert_date":
-            request = create_insert_date_request(
-                op.get("index"),
-                op["date"],
-                date_format=op.get("date_format"),
-                time_format=op.get("time_format"),
-                time_zone_id=op.get("time_zone_id"),
-                locale=op.get("locale"),
-                tab_id=tab_id,
-                segment_id=segment_id,
-                end_of_segment=end_of_segment,
-            )
-            description = (
-                f"insert date chip '{op['date']}' at end of segment '{segment_id or 'body'}'"
-                if end_of_segment
-                else f"insert date chip '{op['date']}' at {op.get('index')}"
-            )
-
         elif op_type == "insert_rich_link":
             request = create_insert_rich_link_request(
                 op.get("index"),
@@ -1307,6 +1318,8 @@ class BatchOperationManager:
                 "update_section_style",
                 "create_header_footer",
                 "insert_image",
+                "insert_person",
+                "insert_date",
                 "insert_doc_tab",
                 "delete_doc_tab",
                 "update_doc_tab",
@@ -1319,8 +1332,6 @@ class BatchOperationManager:
                 "update_table_column_properties",
                 "update_table_row_style",
                 "pin_table_header_rows",
-                "insert_person",
-                "insert_date",
                 "insert_rich_link",
                 "create_footnote",
                 "create_dropdown_definition",
@@ -1349,7 +1360,7 @@ class BatchOperationManager:
         Args:
             document_id: Document ID
             requests: List of API requests
-            write_mode: EDIT or SUGGEST; SUGGEST adds writeControl to the body
+            write_mode: "EDIT" or "SUGGEST"
 
         Returns:
             API response
@@ -1705,6 +1716,35 @@ class BatchOperationManager:
                     ],
                     "description": "Insert an inline image at a location or at the end of a segment",
                 },
+                "insert_person": {
+                    "required": ["email"],
+                    "optional": [
+                        "index",
+                        "end_of_segment",
+                        "after_heading",
+                        "before_heading",
+                        "anchor_text",
+                        "segment_id",
+                        "tab_id",
+                    ],
+                    "description": "Insert a person @mention smart chip",
+                },
+                "insert_date": {
+                    "required": ["date"],
+                    "optional": [
+                        "index",
+                        "end_of_segment",
+                        "after_heading",
+                        "before_heading",
+                        "anchor_text",
+                        "segment_id",
+                        "tab_id",
+                        "date_format",
+                        "time_format",
+                        "timezone",
+                    ],
+                    "description": "Insert a date smart chip",
+                },
                 "insert_doc_tab": {
                     "required": ["title", "index"],
                     "description": "Insert a new document tab with given title at specified index",
@@ -1773,37 +1813,6 @@ class BatchOperationManager:
                     "required": ["table_start_index", "pinned_header_rows_count"],
                     "optional": ["tab_id"],
                     "description": "Pin (repeat) the leading N rows of a table as a header on every page",
-                },
-                "insert_person": {
-                    "required": ["email"],
-                    "optional": [
-                        "name",
-                        "index",
-                        "end_of_segment",
-                        "after_heading",
-                        "before_heading",
-                        "anchor_text",
-                        "segment_id",
-                        "tab_id",
-                    ],
-                    "description": "Insert a person smart chip linked to an email address",
-                },
-                "insert_date": {
-                    "required": ["date"],
-                    "optional": [
-                        "date_format",
-                        "time_format",
-                        "time_zone_id",
-                        "locale",
-                        "index",
-                        "end_of_segment",
-                        "after_heading",
-                        "before_heading",
-                        "anchor_text",
-                        "segment_id",
-                        "tab_id",
-                    ],
-                    "description": "Insert a date smart chip for an ISO 8601 date",
                 },
                 "insert_rich_link": {
                     "required": ["uri"],

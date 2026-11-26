@@ -204,7 +204,7 @@ async def test_remove_denied_under_permission_level(monkeypatch):
     [
         ({"action": "bogus"}, "Invalid action"),
         ({"action": "list"}, "'space_id' is required"),
-        ({"action": "list", "space_id": "S"}, "Invalid space_id"),
+        ({"action": "list", "space_id": "spaces/S/x"}, "Invalid space_id"),
         ({"action": "add", "space_id": "spaces/S"}, "'member' is required"),
         ({"action": "get"}, "either 'membership_name'"),
         (

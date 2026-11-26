@@ -2,10 +2,10 @@
 name: managing-google-workspace
 description: >
   Manages Google Workspace operations across 12 services (Gmail, Drive, Calendar, Docs, Sheets, Slides, Forms, Tasks, Contacts, Chat, Apps Script, Custom Search).
-  Supports MCP tools or CLI via uvx workspace-mcp --cli. Provides tool routing, workflows, and parameter guidance for 114 tools.
+  Supports MCP tools or the workspace-cli client. Provides tool routing, workflows, and parameter guidance for every tool.
   Triggers for "check my email", "find a file", "schedule a meeting", "update the spreadsheet", "share a doc",
   "create a presentation", "add a task", "look up a contact", or any mention of Google Workspace services.
-allowed-tools: Bash(uvx workspace-mcp *)
+allowed-tools: Bash(workspace-cli *), Bash(uv run workspace-cli *)
 user-invocable: false
 ---
 
@@ -19,11 +19,17 @@ Detect which mode is available and use it.
 If MCP tools from the `google-workspace` server are available, call them directly. The tool names in the tables below are the base names -- prefix with the server name as needed (e.g. `google-workspace:search_gmail_messages`).
 
 ### CLI (no MCP)
-If no MCP tools are available, execute via bash:
+If no MCP tools are available, call a running server via `workspace-cli`:
 
 ```bash
-uvx workspace-mcp --cli <tool_name> --args '{"user_google_email": "USER_EMAIL", ...}'
+workspace-cli list
+workspace-cli call <tool_name> key=value ...
 ```
+
+- Pass `user_google_email=USER_EMAIL` only when the tool schema requires it (legacy OAuth 2.0 without `USER_GOOGLE_EMAIL` set). Omit it for OAuth 2.1 and trusted-gateway servers, which take it from the verified identity.
+- Arguments are `key=value` pairs; values are parsed as JSON when possible, so pass lists and objects as JSON (e.g. `label_ids='["INBOX"]'`).
+- The server must be reachable over HTTP. The default URL is `http://localhost:8000/mcp` (a server started with `--transport streamable-http`); override it with `--url` before the subcommand (`workspace-cli --url <url> call ...`) or `WORKSPACE_MCP_URL`. Plugin users on stdio can set `WORKSPACE_MCP_HTTP_PORT` to expose a loopback sidecar at `http://127.0.0.1:<port>/mcp`.
+- If `workspace-cli` is not on PATH, run `uv run workspace-cli` from a checkout of this repo. Installing it permanently (`uv tool install .` in that checkout) is a manual setup step for the user. Never use `uvx workspace-cli`: an unrelated, abandoned PyPI package squats that name.
 
 Before calling a tool, read the relevant reference file for exact parameter names and types. Only use parameters documented there -- do not invent parameters.
 
@@ -69,7 +75,7 @@ For server options, transport, auth modes, tool filtering, and deployment: [refe
 | Task | Tool |
 |------|------|
 | Search/find emails | `search_gmail_messages` |
-| Read one email | `get_gmail_message_content` |
+| Read one email, or page a long body | `get_gmail_message_content` (`page_offset`, `page_size`, `expected_sha256`) |
 | Read multiple emails | `get_gmail_messages_content_batch` |
 | Read a thread | `get_gmail_thread_content` |
 | Read multiple threads | `get_gmail_threads_content_batch` |
@@ -84,6 +90,13 @@ For server options, transport, auth modes, tool filtering, and deployment: [refe
 | List filters | `list_gmail_filters` |
 
 For parameters: [references/gmail.md](references/gmail.md)
+| Applies a mailbox action to one or more Gmail messages | `manage_gmail_message` |
+| Lists, reads, updates, sends or deletes Gmail drafts | `manage_gmail_draft` |
+| Lists Gmail threads or applies an action to whole threads | `manage_gmail_thread` |
+| Read the Gmail profile (address, message and thread totals, history ID) | `get_gmail_profile` |
+| Reads or updates Gmail mailbox settings that need only gmail.settings.basic | `manage_gmail_settings` |
+| Send-as, forwarding and delegate settings (needs gmail.settings.sharing) | `manage_gmail_sharing_settings` |
+| List mailbox changes since a history ID (incremental sync) | `list_gmail_history` |
 
 ### Google Drive
 
@@ -95,6 +108,7 @@ For parameters: [references/gmail.md](references/gmail.md)
 | Download file | `get_drive_file_download_url` |
 | Create file | `create_drive_file` |
 | Create folder | `create_drive_folder` |
+| Create shortcut | `create_drive_file` (`shortcut_target_id`) |
 | Copy file | `copy_drive_file` |
 | Update file metadata | `update_drive_file` |
 | Share / set permissions | `set_drive_file_permissions` |
@@ -103,19 +117,31 @@ For parameters: [references/gmail.md](references/gmail.md)
 | Get shareable link | `get_drive_shareable_link` |
 | Check public access | `check_drive_file_public_access` |
 | Import file to Google Doc | `import_to_google_doc` |
+| Import spreadsheet (XLSX, CSV, ...) to Google Sheets | `import_to_google_sheets` |
+| Import presentation (PPTX, ...) to Google Slides | `import_to_google_slides` |
 
 For parameters: [references/drive.md](references/drive.md)
+| Manage the lifecycle and metadata of a Drive file, folder or shortcut | `manage_drive_file` |
+| Report the Drive account's storage quota, identity and limits | `get_drive_about` |
+| List, inspect, pin, delete or download the version history of a Drive file | `manage_drive_revisions` |
+| Poll the Drive changes feed: what was created, edited, trashed, deleted or unshared | `list_drive_changes` |
+| Create, update, list or delete shared drives (Workspace only) | `manage_shared_drive` |
 
 ### Google Calendar
 
 | Task | Tool |
 |------|------|
 | List calendars | `list_calendars` |
+| Create secondary calendar / share calendar, list, update or remove access | `manage_calendar` |
 | Get events | `get_events` |
-| Create/update/delete event | `manage_event` |
+| Create/update/delete/move event | `manage_event` |
+| Out of office (auto-decline) | `manage_out_of_office` |
+| Focus time (auto-decline, DND) | `manage_focus_time` |
 | Check availability | `query_freebusy` |
 
 For parameters: [references/calendar.md](references/calendar.md)
+| Manages who a calendar is shared with (its access control rules) | `manage_calendar_acl` |
+| Read calendar settings (time zone, locale, week start, defaults) and colours | `get_calendar_settings` |
 
 ### Google Docs
 
@@ -124,8 +150,9 @@ For parameters: [references/calendar.md](references/calendar.md)
 | Read doc as Markdown | `get_doc_as_markdown` |
 | Read doc content (raw) | `get_doc_content` |
 | Read plain text with link/chip targets and document segments | `get_doc_content(preserve_context=True)` |
+| Read only the section under one heading | `get_doc_as_markdown(heading=...)` or `get_doc_content(heading=...)` |
 | Create new doc | `create_doc` |
-| Modify text / apply styles | `modify_doc_text` |
+| Modify text / apply styles (by index or by `heading`) | `modify_doc_text` |
 | Insert elements (tables, lists, breaks) | `insert_doc_elements` |
 | Insert image | `insert_doc_image` |
 | Create table with data | `create_table_with_data` |
@@ -142,6 +169,8 @@ For parameters: [references/calendar.md](references/calendar.md)
 | Debug table structure | `debug_table_structure` |
 
 For parameters: [references/docs.md](references/docs.md)
+| Create, reply to, resolve, edit, delete and list comment threads anchored to document text | `manage_doc_comments` |
+| List, accept, reject or delete tracked suggestions in a Doc | `manage_doc_suggestions` |
 
 ### Google Sheets
 
@@ -150,28 +179,42 @@ For parameters: [references/docs.md](references/docs.md)
 | Read cell values | `read_sheet_values` |
 | Write/append/clear values | `modify_sheet_values` |
 | Insert smart chips | `modify_sheet_values` (`chips`) |
+| Copy/paste a range with formulas and formatting | `modify_sheet_values` (`source_range`) |
+| Load rows from a local CSV/TSV file into an existing sheet | `modify_sheet_values` (`file_path`) |
 | Format cells | `format_sheet_range` |
 | Conditional formatting | `manage_conditional_formatting` |
 | Get spreadsheet info | `get_spreadsheet_info` |
 | Create spreadsheet | `create_spreadsheet` |
 | Create sheet (tab) | `create_sheet` |
+| Rename/delete/hide/reorder/style tab | `manage_sheet_tab` |
+| Resize/freeze/hide/insert/delete rows and columns | `resize_sheet_dimensions` |
 | Move rows between sheets | `move_sheet_rows` |
+| List structured tables | `list_sheet_tables` |
+| Append rows to structured table | `append_table_rows` |
 | Manage named ranges | `manage_named_range` |
 | List spreadsheets | `list_spreadsheets` |
 | Comments | `manage_spreadsheet_comment` / `list_spreadsheet_comments` |
 
 For parameters: [references/sheets.md](references/sheets.md)
+| Apply raw Sheets API batchUpdate requests to a spreadsheet | `batch_update_sheet` |
+| Manage a sheet's basic filter and its saved filter views | `manage_sheet_filter` |
+| List, add, update or delete protected ranges (and protected sheets) | `manage_sheet_protection` |
+| Set or clear data validation on a range (dropdowns, checkboxes, number/date/text rules) | `manage_sheet_validation` |
+| List, add, update, move/resize or delete embedded charts | `manage_sheet_chart` |
+| Sort the rows of a range by one or more columns (sortRange) | `sort_sheet_range` |
+| Find and replace text across a range, one sheet, or the whole spreadsheet | `find_replace_sheet` |
 
 ### Google Slides
 
 | Task | Tool |
 |------|------|
-| Get presentation | `get_presentation` |
-| Get specific slide | `get_page` |
-| Get slide thumbnail | `get_page_thumbnail` |
+| List slides and layouts | `get_presentation` (`action="deck"`) |
+| Read a slide's elements and text | `get_presentation` (`action="page"`) |
+| A slide's geometry and styles as JSON | `get_presentation` (`action="markup"`) |
+| Look at a slide (render to image) | `render_page_to_image` |
 | Create presentation | `create_presentation` |
 | Batch update | `batch_update_presentation` |
-| Speaker notes | `get_presentation` (`include_speaker_notes`) + `batch_update_presentation` |
+| Speaker notes | `get_presentation` (`action="page"`) + `batch_update_presentation` |
 | Comments | `manage_presentation_comment` / `list_presentation_comments` |
 
 For parameters: [references/slides.md](references/slides.md)
@@ -216,20 +259,29 @@ For parameters: [references/tasks.md](references/tasks.md)
 | List all contacts | `list_contacts` |
 
 For parameters: [references/contacts.md](references/contacts.md)
+| List or search "Other contacts": people the user has interacted with (e.g | `list_other_contacts` |
+| Search the Workspace directory (colleagues, profiles, groups) | `search_directory` |
+| Set or remove a contact's photo | `manage_contact_photo` |
 
 ### Google Chat
 
 | Task | Tool |
 |------|------|
 | List spaces | `list_spaces` |
+| List a space's members | `list_spaces` (`space_id`) |
 | Get messages | `get_messages` |
 | Search messages | `search_messages` |
 | Send message | `send_message` |
-| Edit a message already sent | `send_message` with `message_name` |
+| Edit a message already sent | `send_message` (`message_name`) |
 | React to message | `create_reaction` |
 | Download attachment | `download_chat_attachment` |
 
 For parameters: [references/chat.md](references/chat.md)
+| Lists, inspects, adds, re-roles, or removes members of a Google Chat space | `manage_chat_member` |
+| Gets, edits, or deletes a single Google Chat message by resource name | `manage_chat_message` |
+| Lists the emoji reactions on a Google Chat message, or deletes one of yours | `manage_chat_reaction` |
+| Finds the existing direct message space between you and another user | `find_chat_direct_message` |
+| Creates, sets up, updates, deletes, or searches Google Chat spaces | `manage_chat_space` |
 
 ### Google Apps Script
 
@@ -258,13 +310,43 @@ For parameters: [references/apps-script.md](references/apps-script.md)
 
 For parameters: [references/search.md](references/search.md)
 
+### Google Meet
+
+Reference: `references/meet.md`
+
+| Task | Tool |
+|------|------|
+| Create, inspect, reconfigure a Google Meet space, or end its active conference | `manage_meet_space` |
+| List, inspect, add, re-role or remove members of a Google Meet space | `manage_meet_member` |
+| List past and active Google Meet conferences, or fetch one conference record | `list_meet_conference_records` |
+| Attendees, recordings and transcripts of a Meet conference | `get_meet_conference_artifacts` |
+
+### Google Keep
+
+Reference: `references/keep.md`
+
+| Task | Tool |
+|------|------|
+| List Keep notes as a compact summary | `list_keep_notes` |
+| Get one Keep note with its text or checklist | `get_keep_note` |
+| Create or delete a Google Keep note | `manage_keep_note` |
+| List, grant or revoke collaborator access on a Google Keep note | `manage_keep_note_permissions` |
+
+### REST passthrough
+
+Reference: `references/api.md`
+
+| Task | Tool |
+|------|------|
+| Call any REST method of a Google API this server is configured for | `google_api_request` |
+
 ### Auth
 
 | Task | Tool |
 |------|------|
 | Start OAuth flow | `start_google_auth` |
 
-Parameters: `user_google_email` (string, optional), `service_name` (string, required -- e.g. `"gmail"`, `"drive"`). Legacy OAuth 2.0 only -- disabled when OAuth 2.1 is enabled. In most cases, just call the tool you need and auth happens automatically.
+Legacy OAuth 2.0 only -- disabled when OAuth 2.1 is enabled. In most cases, just call the tool you need and auth happens automatically. For parameters: [references/server-options.md](references/server-options.md#start_google_auth)
 
 ## Common Workflows
 
@@ -304,4 +386,4 @@ Parameters: `user_google_email` (string, optional), `service_name` (string, requ
 
 ## Tips
 
-- **Check parameters**: In CLI mode, run `uvx workspace-mcp --cli <tool> --help` for any unfamiliar tool.
+- **Check parameters**: The reference files document every parameter of every tool. In CLI mode, `workspace-cli list` shows which tools the running server exposes.

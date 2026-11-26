@@ -65,7 +65,7 @@ async def google_api_request(
     bytes as base64 when return_base64 is true. On an unknown segment the error
     lists the collections and methods available at that level.
 
-    Examples:
+    For example:
       calendar  method='events.move'
                 params={'calendarId': 'primary', 'eventId': 'abc123', 'destination': 'work@group.calendar.google.com'}
       gmail     method='users.drafts.list'

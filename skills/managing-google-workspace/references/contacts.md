@@ -19,6 +19,7 @@ Search contacts by name, email, phone number, or other fields.
 | query | string | yes | | Searches names, emails, phone numbers |
 | user_google_email | string | yes | | |
 | page_size | integer | no | 30 | Max 30 |
+| source | string | no | saved | `saved` or `other` (people you've emailed but never saved; needs the contacts.other.readonly scope, user OAuth only, not available in service-account mode) |
 
 ### list_contacts
 List contacts for the authenticated user.
@@ -29,6 +30,12 @@ List contacts for the authenticated user.
 | page_size | integer | no | 100 | Max 1000 |
 | page_token | any | no | | Pagination token |
 | sort_order | string | no | | `LAST_MODIFIED_ASCENDING`, `LAST_MODIFIED_DESCENDING`, `FIRST_NAME_ASCENDING`, or `LAST_NAME_ASCENDING` |
+| request_sync_token | boolean | no | false | Start a full sync; the last page ends with `Next sync token` |
+| sync_token | string | no | | List changes since that sync token; deleted contacts show `Deleted: yes` |
+
+Keep every argument unchanged when following `page_token`. `sort_order` is
+rejected when syncing. Sync tokens expire after seven days; an expired token
+returns a message asking for a new full sync.
 
 ### get_contact
 Get detailed information about a specific contact.
@@ -39,31 +46,50 @@ Get detailed information about a specific contact.
 | user_google_email | string | yes | | |
 
 ### manage_contact
-Create, update, or delete a contact.
+Create, update, or delete a contact. `create` and `update` need at least one field.
+
+On `update`, each list field has a `*_mode` companion that controls how the list combines with what the contact already has: `merge` (default) adds new entries and skips duplicates, `replace` overwrites the whole list, and `remove` deletes the entries that match the ones you pass. Modes are ignored on `create`.
 
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
 | action | string | yes | | `create`, `update`, or `delete` |
 | user_google_email | string | yes | | |
-| contact_id | string | conditional | | Required for `update` and `delete` |
-| given_name | string | no | | First name (`create`, `update`) |
-| family_name | string | no | | Last name (`create`, `update`) |
-| email | string | no | | Email address (`create`, `update`) |
-| phone | string | no | | Phone number (`create`, `update`) |
-| organization | string | no | | Company/organization (`create`, `update`) |
-| job_title | string | no | | Job title (`create`, `update`) |
-| notes | string | no | | Additional notes (`create`, `update`) |
+| contact_id | string | conditional | | Required for `update` and `delete`. `c123` or `people/c123` |
+| given_name | string | no | | First name |
+| family_name | string | no | | Last name |
+| phones | array | no | | `[{number, type?}]`. Types include `mobile`, `work`, `home`, `main`, `workMobile`, `other`; use `internal` for PBX short numbers |
+| emails | array | no | | `[{address, type?}]`, type e.g. `work`, `home`, `other` |
+| organizations | array | no | | `[{name?, title?, department?, jobDescription?, type?}]` |
+| nicknames | array | no | | `[{value, type?}]` or plain strings. Types: `default`, `alternate_name`, `maiden_name`, `initials`, `other` |
+| urls | array | no | | `[{value, type?}]` or plain strings. Types: `homepage`, `blog`, `profile`, `work`, `ftp`, `reservations`, `other` |
+| user_defined | array | no | | Custom fields `[{key, value}]`. `value` may be omitted in `remove` mode. `merge` overwrites the value of a matching key |
+| relations | array | no | | `[{person, type?}]` or plain names. Types include `spouse`, `child`, `parent`, `friend`, `manager`, `assistant` |
+| notes | string | no | | Free-text notes. `""` clears them |
+| address | string | no | | Street address; replaces existing addresses. `""` clears them |
+| birthday | string | no | | `YYYY-MM-DD`, `MM-DD` (no year), or `clear`/`""` to remove |
+| phones_mode | string | no | merge | `merge`, `replace`, or `remove` (`update` only) |
+| emails_mode | string | no | merge | `merge`, `replace`, or `remove` (`update` only) |
+| organizations_mode | string | no | merge | `merge`, `replace`, or `remove` (`update` only) |
+| nicknames_mode | string | no | merge | `merge`, `replace`, or `remove` (`update` only) |
+| urls_mode | string | no | merge | `merge`, `replace`, or `remove` (`update` only) |
+| user_defined_mode | string | no | merge | `merge`, `replace`, or `remove` (`update` only) |
+| relations_mode | string | no | merge | `merge`, `replace`, or `remove` (`update` only) |
+| email | string | no | | Deprecated, use `emails`. Ignored when `emails` is set |
+| phone | string | no | | Deprecated, use `phones`. Ignored when `phones` is set |
+| organization | string | no | | Deprecated, use `organizations`. Ignored when `organizations` is set |
+| job_title | string | no | | Deprecated, use `organizations`. Ignored when `organizations` is set |
 
 ### manage_contacts_batch
-Batch create, update, or delete contacts.
+Batch create, update, or delete up to 200 contacts. A batch `update` writes one field per call and replaces that field outright (no `*_mode` merging); only `names` keeps the name parts you leave out.
 
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
 | action | string | yes | | `create`, `update`, or `delete` |
 | user_google_email | string | yes | | |
-| contacts | array | conditional | | For `create`: list of dicts with `given_name`, `family_name`, `email`, `phone`, `organization`, `job_title` |
-| updates | array | conditional | | For `update`: list of dicts, each must include `contact_id` plus fields to update |
+| contacts | array | conditional | | For `create`: list of dicts with the same fields as `manage_contact` (`given_name`, `phones`, `emails`, `birthday`, etc.) |
+| updates | array | conditional | | For `update`: list of dicts, each with `contact_id` plus the data for `field`. Entries missing that data are skipped |
 | contact_ids | array | conditional | | For `delete`: list of contact ID strings |
+| field | string | for update | | The single field to write: `names`, `phoneNumbers`, `emailAddresses`, `organizations`, `nicknames`, `urls`, `userDefined`, `relations`, `biographies`, `addresses`, or `birthdays` |
 
 ---
 
@@ -109,3 +135,43 @@ Create, update, delete a contact group, or modify its members.
 **Batch organisation**: Use contact groups to organise contacts into categories. Create a group with `manage_contact_group`, then add contacts to it with the `modify_members` action.
 
 **Extra context**: The `notes` field on a contact is a free-text area useful for storing context that does not fit into structured fields (e.g. how you met, preferred contact method).
+
+### list_other_contacts
+List or search "Other contacts": people the user has interacted with (e.g. emailed)
+who are not saved in My Contacts. Use manage_contact action="copy_to_my_contacts"
+with the returned "otherContacts/..." ID to promote one into My Contacts.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes |  | The user's Google email address. Required. |
+| action | string | no | "list" | "list" (paged listing, default) or "search" (prefix match on names, emails and phone numbers). |
+| query | string | no |  | Search text. Required for "search". |
+| page_size | integer | no | 100 | Results per page. "list": 1-1000 (default 100). "search": 1-30 (values above 30 are capped by the API). |
+| page_token | string | no |  | Token from a previous "list" page. Ignored by "search". |
+| read_mask | string | no |  | Comma-separated Person fields to return. Other contacts support only names, emailAddresses, phoneNumbers, metadata (and photos for "list"). Default:… |
+
+### search_directory
+Search or list people in the Google Workspace domain directory (colleagues'
+profiles and domain shared contacts). Google Workspace accounts only: personal
+@gmail.com accounts have no directory and get a 403/empty result.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes |  | The user's Google email address. Required. |
+| action | string | no | "search" | "search" (prefix match on the person's fields, default) or "list" (page through the whole directory). |
+| query | string | no |  | Search text. Required for "search". |
+| sources | array | no |  | Directory sources: "DOMAIN_PROFILE" (user profiles) and/or "DOMAIN_CONTACT" (domain shared contacts). Full enum names "DIRECTORY_SOURCE_TYPE_*" are also… |
+| page_size | integer | no | 100 | Results per page. "search": 1-500; "list": 1-1000 (default 100). |
+| page_token | string | no |  | Token from a previous page of the same action. |
+| read_mask | string | no |  | Comma-separated Person fields to return. Default: "names,emailAddresses,phoneNumbers,organizations". |
+
+### manage_contact_photo
+Set or remove a contact's photo.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes |  | The user's Google email address. Required. |
+| action | string | yes |  | "update" (set/replace the photo) or "delete" (remove it). |
+| contact_id | string | yes |  | The contact ID ("c123" or "people/c123"). |
+| image_url | string | no |  | For "update": public http(s) URL of the image; it is downloaded server-side (max 10 MiB). Provide this or image_base64, not both. |
+| image_base64 | string | no |  | For "update": the image as base64 (a "data:image/...;base64," prefix is accepted). |

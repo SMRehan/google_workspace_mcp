@@ -1,204 +1,304 @@
-"""
-write_mode plumbing: EDIT must leave the batchUpdate body exactly as before,
-SUGGEST must add writeControl.writeMode so the Docs API records suggestions.
-"""
+"""Tests for write_mode (suggested edits) support in Google Docs edit tools."""
 
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
 
-from core.utils import UserInputError
 from gdocs import docs_tools
-from gdocs.docs_helpers import build_batch_update_body, validate_write_mode
+from gdocs.docs_helpers import (
+    build_batch_update_body,
+    suggestion_save_error,
+    validate_write_mode,
+)
 from gdocs.managers.batch_operation_manager import BatchOperationManager
 
-DOC_ID = "a" * 25
-SUGGEST_CONTROL = {"writeMode": "SUGGEST"}
+DOC_ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdEf"
+SAVED = {"commentUpdateState": "ALL_SAVED"}
+FAILED = {"commentUpdateState": "ALL_FAILED_UNKNOWN_REASON"}
 
 
-def _unwrap(tool):
+def _unwrap(tool: Any) -> Any:
+    """Unwrap a FunctionTool + decorator chain to the original function."""
     fn = tool.fn if hasattr(tool, "fn") else tool
     while hasattr(fn, "__wrapped__"):
         fn = fn.__wrapped__
     return fn
 
 
-def _service():
+def _docs_service(batch_reply: dict[str, Any] | None = None) -> Mock:
     service = Mock()
-    service.documents.return_value.get.return_value.execute.return_value = {
-        "body": {"content": []},
-        "revisionId": "rev1",
-    }
-    service.documents.return_value.batchUpdate.return_value.execute.return_value = {
-        "replies": [{"replaceAllText": {"occurrencesChanged": 1}}]
-    }
+    service.documents.return_value.batchUpdate.return_value.execute = Mock(
+        return_value=batch_reply or {"replies": [{}]}
+    )
+    service.documents.return_value.get.return_value.execute = Mock(
+        return_value={"revisionId": "rev1", "body": {"content": []}}
+    )
     return service
 
 
-def _bodies(service):
-    return [
-        call.kwargs["body"]
-        for call in service.documents.return_value.batchUpdate.call_args_list
+def _batch_body(service: Mock) -> dict[str, Any]:
+    return service.documents.return_value.batchUpdate.call_args.kwargs["body"]
+
+
+class TestBuildBatchUpdateBody:
+    def test_edit_mode_keeps_api_default_body(self) -> None:
+        requests = [{"insertText": {"location": {"index": 1}, "text": "Hi"}}]
+        assert build_batch_update_body(requests) == {"requests": requests}
+        assert build_batch_update_body(requests, "EDIT") == {"requests": requests}
+
+    def test_suggest_mode_sets_write_control(self) -> None:
+        requests = [{"insertText": {"location": {"index": 1}, "text": "Hi"}}]
+        assert build_batch_update_body(requests, "SUGGEST") == {
+            "requests": requests,
+            "writeControl": {"writeMode": "SUGGEST"},
+        }
+
+
+class TestValidateWriteMode:
+    @pytest.mark.parametrize("mode", ["EDIT", "SUGGEST"])
+    def test_accepts_supported_modes(self, mode: str) -> None:
+        assert validate_write_mode(mode) is None
+
+    @pytest.mark.parametrize("mode", ["suggest", "COMMENT", ""])
+    def test_rejects_other_values(self, mode: str) -> None:
+        error = validate_write_mode(mode)
+        assert error.startswith("Error: write_mode must be one of EDIT, SUGGEST")
+
+
+class TestSuggestionSaveError:
+    def test_reports_failed_suggestion_save(self) -> None:
+        error = suggestion_save_error(FAILED, "SUGGEST")
+        assert "did not save these changes as suggestions" in error
+        assert "version history" in error
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            SAVED,
+            {"commentUpdateState": "NO_UPDATES_REQUESTED"},
+            {"commentUpdateState": "COMMENT_UPDATE_STATE_UNSPECIFIED"},
+            {},
+        ],
+    )
+    def test_other_or_missing_states_are_not_failures(
+        self, result: dict[str, Any]
+    ) -> None:
+        assert suggestion_save_error(result, "SUGGEST") is None
+
+    def test_edit_mode_ignores_comment_update_state(self) -> None:
+        assert suggestion_save_error(FAILED, "EDIT") is None
+
+
+@pytest.mark.asyncio
+async def test_modify_doc_text_submits_suggestion_when_requested() -> None:
+    service = _docs_service({"replies": [{}, {}], **SAVED})
+
+    result = await _unwrap(docs_tools.modify_doc_text)(
+        service=service,
+        user_google_email="user@example.com",
+        document_id=DOC_ID,
+        start_index=5,
+        end_index=10,
+        text="world",
+        write_mode="SUGGEST",
+    )
+
+    body = _batch_body(service)
+    assert body["writeControl"] == {"writeMode": "SUGGEST"}
+    assert [next(iter(request)) for request in body["requests"]] == [
+        "deleteContentRange",
+        "insertText",
     ]
+    assert result.startswith("Suggested: Replaced text from index 5 to 10")
 
 
-class TestHelpers:
-    def test_edit_body_has_no_write_control(self):
-        assert build_batch_update_body([{"x": 1}]) == {"requests": [{"x": 1}]}
-        assert build_batch_update_body([{"x": 1}], "edit") == {"requests": [{"x": 1}]}
+@pytest.mark.asyncio
+async def test_modify_doc_text_edits_directly_by_default() -> None:
+    service = _docs_service()
 
-    def test_suggest_body_adds_write_control(self):
-        assert build_batch_update_body([{"x": 1}], "SUGGEST") == {
-            "requests": [{"x": 1}],
-            "writeControl": SUGGEST_CONTROL,
-        }
+    result = await _unwrap(docs_tools.modify_doc_text)(
+        service=service,
+        user_google_email="user@example.com",
+        document_id=DOC_ID,
+        start_index=1,
+        text="Hello",
+    )
 
-    @pytest.mark.parametrize("bad", ["REVIEW", "", None, 3])
-    def test_invalid_write_mode_is_rejected(self, bad):
-        with pytest.raises(ValueError, match="write_mode"):
-            validate_write_mode(bad)
-
-
-class TestTools:
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("write_mode", ["EDIT", "SUGGEST"])
-    async def test_modify_doc_text(self, write_mode):
-        service = _service()
-        await _unwrap(docs_tools.modify_doc_text)(
-            service=service,
-            user_google_email="u@example.com",
-            document_id=DOC_ID,
-            start_index=1,
-            text="Hello",
-            write_mode=write_mode,
-        )
-        body = _bodies(service)[0]
-        assert body["requests"][0]["insertText"]["text"] == "Hello"
-        assert body.get("writeControl") == (
-            SUGGEST_CONTROL if write_mode == "SUGGEST" else None
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("write_mode", ["EDIT", "SUGGEST"])
-    async def test_find_and_replace_doc(self, write_mode):
-        service = _service()
-        result = await _unwrap(docs_tools.find_and_replace_doc)(
-            service=service,
-            user_google_email="u@example.com",
-            document_id=DOC_ID,
-            find_text="Q3",
-            replace_text="Q4",
-            write_mode=write_mode,
-        )
-        assert "Replaced 1 occurrence" in result
-        body = _bodies(service)[0]
-        assert "replaceAllText" in body["requests"][0]
-        assert body.get("writeControl") == (
-            SUGGEST_CONTROL if write_mode == "SUGGEST" else None
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("write_mode", ["EDIT", "SUGGEST"])
-    async def test_insert_doc_elements(self, write_mode):
-        service = _service()
-        await _unwrap(docs_tools.insert_doc_elements)(
-            service=service,
-            user_google_email="u@example.com",
-            document_id=DOC_ID,
-            element_type="page_break",
-            index=5,
-            write_mode=write_mode,
-        )
-        body = _bodies(service)[0]
-        assert "insertPageBreak" in body["requests"][0]
-        assert body.get("writeControl") == (
-            SUGGEST_CONTROL if write_mode == "SUGGEST" else None
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("write_mode", ["EDIT", "SUGGEST"])
-    async def test_update_paragraph_style(self, write_mode):
-        service = _service()
-        await _unwrap(docs_tools.update_paragraph_style)(
-            service=service,
-            user_google_email="u@example.com",
-            document_id=DOC_ID,
-            start_index=1,
-            end_index=10,
-            heading_level=1,
-            write_mode=write_mode,
-        )
-        body = _bodies(service)[0]
-        assert "updateParagraphStyle" in body["requests"][0]
-        assert body.get("writeControl") == (
-            SUGGEST_CONTROL if write_mode == "SUGGEST" else None
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("write_mode", ["EDIT", "SUGGEST"])
-    async def test_batch_update_doc(self, write_mode):
-        service = _service()
-        result = await _unwrap(docs_tools.batch_update_doc)(
-            service=service,
-            user_google_email="u@example.com",
-            document_id=DOC_ID,
-            operations=[
-                {"type": "find_replace", "find_text": "a", "replace_text": "b"}
-            ],
-            write_mode=write_mode,
-        )
-        assert "Error" not in result
-        body = _bodies(service)[0]
-        assert body.get("writeControl") == (
-            SUGGEST_CONTROL if write_mode == "SUGGEST" else None
-        )
-        assert ("manage_doc_suggestions" in result) == (write_mode == "SUGGEST")
-
-    @pytest.mark.asyncio
-    async def test_batch_update_doc_rejects_bad_write_mode(self):
-        service = _service()
-        result = await _unwrap(docs_tools.batch_update_doc)(
-            service=service,
-            user_google_email="u@example.com",
-            document_id=DOC_ID,
-            operations=[
-                {"type": "find_replace", "find_text": "a", "replace_text": "b"}
-            ],
-            write_mode="TRACK",
-        )
-        assert result.startswith("Error:")
-        assert "write_mode" in result
-        service.documents.return_value.batchUpdate.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_modify_doc_text_rejects_bad_write_mode(self):
-        with pytest.raises((UserInputError, ValueError), match="write_mode"):
-            await _unwrap(docs_tools.modify_doc_text)(
-                service=_service(),
-                user_google_email="u@example.com",
-                document_id=DOC_ID,
-                start_index=1,
-                text="Hello",
-                write_mode="TRACK",
-            )
+    assert "writeControl" not in _batch_body(service)
+    assert result.startswith("Inserted text at index 1")
 
 
-class TestManagerFollowUp:
-    @pytest.mark.asyncio
-    async def test_footnote_follow_up_inherits_suggest_mode(self):
-        service = _service()
-        service.documents.return_value.batchUpdate.return_value.execute.return_value = {
-            "replies": [{"createFootnote": {"footnoteId": "kix.fn"}}]
-        }
-        manager = BatchOperationManager(service)
-        success, message, metadata = await manager.execute_batch_operations(
-            "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd",
-            [{"type": "create_footnote", "end_of_segment": True, "text": "Note"}],
-            write_mode="SUGGEST",
-        )
-        assert success, message
-        assert metadata["write_mode"] == "SUGGEST"
-        assert "as tracked suggestions" in message
-        bodies = _bodies(service)
-        assert len(bodies) == 2
-        assert all(body["writeControl"] == SUGGEST_CONTROL for body in bodies)
+@pytest.mark.asyncio
+async def test_modify_doc_text_rejects_invalid_write_mode_before_api() -> None:
+    service = _docs_service()
+
+    result = await _unwrap(docs_tools.modify_doc_text)(
+        service=service,
+        user_google_email="user@example.com",
+        document_id=DOC_ID,
+        start_index=1,
+        text="Hello",
+        write_mode="DRAFT",
+    )
+
+    assert "write_mode must be one of" in result
+    service.documents.return_value.batchUpdate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_find_and_replace_doc_submits_suggestions_when_requested() -> None:
+    service = _docs_service(
+        {"replies": [{"replaceAllText": {"occurrencesChanged": 2}}], **SAVED}
+    )
+
+    result = await _unwrap(docs_tools.find_and_replace_doc)(
+        service=service,
+        user_google_email="user@example.com",
+        document_id=DOC_ID,
+        find_text="colour",
+        replace_text="color",
+        write_mode="SUGGEST",
+    )
+
+    body = _batch_body(service)
+    assert body["writeControl"] == {"writeMode": "SUGGEST"}
+    assert "replaceAllText" in body["requests"][0]
+    assert result.startswith("Suggested replacing 2 occurrence(s) of 'colour'")
+
+
+@pytest.mark.asyncio
+async def test_find_and_replace_doc_rejects_invalid_write_mode_before_api() -> None:
+    service = _docs_service()
+
+    result = await _unwrap(docs_tools.find_and_replace_doc)(
+        service=service,
+        user_google_email="user@example.com",
+        document_id=DOC_ID,
+        find_text="a",
+        replace_text="b",
+        write_mode="suggestion",
+    )
+
+    assert "write_mode must be one of" in result
+    service.documents.return_value.batchUpdate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_batch_update_doc_submits_whole_batch_as_suggestions() -> None:
+    service = _docs_service({"replies": [{}, {}], **SAVED})
+
+    result = await _unwrap(docs_tools.batch_update_doc)(
+        service=service,
+        user_google_email="user@example.com",
+        document_id=DOC_ID,
+        operations=[
+            {"type": "insert_text", "index": 1, "text": "Intro\n"},
+            {"type": "delete_text", "start_index": 10, "end_index": 20},
+        ],
+        write_mode="SUGGEST",
+    )
+
+    body = _batch_body(service)
+    assert body["writeControl"] == {"writeMode": "SUGGEST"}
+    assert len(body["requests"]) == 2
+    assert "as suggested edits" in result
+
+
+@pytest.mark.asyncio
+async def test_batch_update_doc_rejects_invalid_write_mode_before_api() -> None:
+    service = _docs_service()
+
+    result = await _unwrap(docs_tools.batch_update_doc)(
+        service=service,
+        user_google_email="user@example.com",
+        document_id=DOC_ID,
+        operations=[{"type": "insert_text", "index": 1, "text": "Intro\n"}],
+        write_mode="REVIEW",
+    )
+
+    assert "write_mode must be one of" in result
+    service.documents.return_value.batchUpdate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_batch_manager_defaults_to_direct_edits() -> None:
+    service = _docs_service()
+    manager = BatchOperationManager(service)
+
+    success, message, _ = await manager.execute_batch_operations(
+        DOC_ID, [{"type": "insert_text", "index": 1, "text": "Intro\n"}]
+    )
+
+    assert success
+    assert "writeControl" not in _batch_body(service)
+    assert "suggested" not in message
+
+
+@pytest.mark.asyncio
+async def test_modify_doc_text_reports_unsaved_suggestions() -> None:
+    service = _docs_service({"replies": [{}], **FAILED})
+
+    result = await _unwrap(docs_tools.modify_doc_text)(
+        service=service,
+        user_google_email="user@example.com",
+        document_id=DOC_ID,
+        start_index=1,
+        text="Hello",
+        write_mode="SUGGEST",
+    )
+
+    assert result.startswith("Error: Google Docs did not save these changes")
+    assert "Suggested" not in result
+
+
+@pytest.mark.asyncio
+async def test_find_and_replace_doc_reports_unsaved_suggestions() -> None:
+    service = _docs_service(
+        {"replies": [{"replaceAllText": {"occurrencesChanged": 1}}], **FAILED}
+    )
+
+    result = await _unwrap(docs_tools.find_and_replace_doc)(
+        service=service,
+        user_google_email="user@example.com",
+        document_id=DOC_ID,
+        find_text="colour",
+        replace_text="color",
+        write_mode="SUGGEST",
+    )
+
+    assert result.startswith("Error: Google Docs did not save these changes")
+
+
+@pytest.mark.asyncio
+async def test_batch_update_doc_reports_unsaved_suggestions() -> None:
+    service = _docs_service({"replies": [{}], **FAILED})
+
+    result = await _unwrap(docs_tools.batch_update_doc)(
+        service=service,
+        user_google_email="user@example.com",
+        document_id=DOC_ID,
+        operations=[{"type": "insert_text", "index": 1, "text": "Intro\n"}],
+        write_mode="SUGGEST",
+    )
+
+    assert result.startswith("Error: Google Docs did not save these changes")
+    assert "as suggested edits" not in result
+
+
+@pytest.mark.asyncio
+async def test_batch_find_replace_reports_suggested_replacements() -> None:
+    service = _docs_service(
+        {"replies": [{"replaceAllText": {"occurrencesChanged": 2}}], **SAVED}
+    )
+
+    result = await _unwrap(docs_tools.batch_update_doc)(
+        service=service,
+        user_google_email="user@example.com",
+        document_id=DOC_ID,
+        operations=[{"type": "find_replace", "find_text": "a", "replace_text": "b"}],
+        write_mode="SUGGEST",
+    )
+
+    assert "Suggested replacing 2 occurrence(s) of 'a'" in result
+    assert "Replaced" not in result

@@ -12,7 +12,7 @@ from core.utils import UserInputError
 from gcalendar.calendar_helpers import (
     import_event,
     list_event_instances,
-    move_event,
+    _move_event,
     quick_add_event,
 )
 from gcalendar.calendar_tools import manage_event
@@ -69,30 +69,34 @@ class TestMove:
             "destination": "team@group.calendar.google.com",
             "sendUpdates": "none",
         }
-        assert "Successfully moved event 'Standup'" in result
-        assert "team@group.calendar.google.com" in result
+        assert "Moved event 'Standup' (ID: evt-1)" in result
+        assert "from calendar 'primary' to 'team@group.calendar.google.com'" in result
 
     @pytest.mark.asyncio
-    async def test_send_updates_defaults_to_all(self):
+    async def test_send_updates_defaults_to_none(self):
         service = Mock()
         service.events().move().execute = Mock(return_value=_event())
         await _manage(
             service, action="move", event_id="evt-1", destination_calendar_id="other"
         )
-        assert service.events().move.call_args.kwargs["sendUpdates"] == "all"
+        assert service.events().move.call_args.kwargs["sendUpdates"] == "none"
 
     @pytest.mark.asyncio
     async def test_requires_event_id_and_destination(self):
-        with pytest.raises(ValueError, match="event_id is required for move"):
+        with pytest.raises(
+            UserInputError, match="event_id and destination_calendar_id"
+        ):
             await _manage(Mock(), action="move", destination_calendar_id="other")
-        with pytest.raises(ValueError, match="destination_calendar_id is required"):
+        with pytest.raises(
+            UserInputError, match="event_id and destination_calendar_id"
+        ):
             await _manage(Mock(), action="move", event_id="evt-1")
 
     @pytest.mark.asyncio
     async def test_rejects_same_source_and_destination(self):
         service = Mock()
         with pytest.raises(UserInputError, match="must differ"):
-            await move_event(service, EMAIL, "evt-1", "primary", "primary")
+            await _move_event(service, "primary", "evt-1", "primary", "none")
         service.events().move.assert_not_called()
 
     @pytest.mark.asyncio
@@ -142,7 +146,7 @@ class TestQuickAdd:
 
     @pytest.mark.asyncio
     async def test_requires_text(self):
-        with pytest.raises(ValueError, match="text is required"):
+        with pytest.raises(UserInputError, match="text is required"):
             await _manage(Mock(), action="quick_add")
         with pytest.raises(UserInputError, match="text is required"):
             await quick_add_event(Mock(), EMAIL, "   ")
@@ -150,7 +154,7 @@ class TestQuickAdd:
     @pytest.mark.asyncio
     async def test_invalid_send_updates_is_rejected_before_the_api_call(self):
         service = Mock()
-        with pytest.raises(ValueError, match="Invalid send_updates"):
+        with pytest.raises(UserInputError, match="Invalid send_updates"):
             await _manage(service, action="quick_add", text="x", send_updates="bogus")
         service.events().quickAdd.assert_not_called()
 
@@ -246,7 +250,7 @@ class TestInstances:
 
     @pytest.mark.asyncio
     async def test_requires_event_id_and_positive_max_results(self):
-        with pytest.raises(ValueError, match="event_id is required for instances"):
+        with pytest.raises(UserInputError, match="event_id is required for instances"):
             await _manage(Mock(), action="instances")
         with pytest.raises(UserInputError, match="positive"):
             await list_event_instances(Mock(), EMAIL, "series", max_results=0)
@@ -312,11 +316,13 @@ class TestImport:
 
     @pytest.mark.asyncio
     async def test_requires_ical_uid_and_times(self):
-        with pytest.raises(ValueError, match="ical_uid is required"):
+        with pytest.raises(UserInputError, match="ical_uid is required"):
             await _manage(
                 Mock(), action="import", start_time="2026-06-01", end_time="2026-06-02"
             )
-        with pytest.raises(ValueError, match="start_time and end_time are required"):
+        with pytest.raises(
+            UserInputError, match="start_time and end_time are required"
+        ):
             await _manage(
                 Mock(), action="import", ical_uid="uid", start_time="2026-06-01"
             )
@@ -334,6 +340,6 @@ class TestImport:
 @pytest.mark.asyncio
 async def test_invalid_action_message_lists_the_new_actions():
     with pytest.raises(
-        ValueError, match="'move', 'quick_add', 'instances', or 'import'"
+        UserInputError, match="'move', 'quick_add', 'instances', or 'import'"
     ):
         await _manage(Mock(), action="bogus")

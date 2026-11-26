@@ -42,7 +42,9 @@ async def _call(service, **kwargs):
 async def test_border_style_alone_sends_update_borders_on_all_sides():
     service = service_with(TWO_SHEETS)
 
-    result = await _call(service, border_style="solid", border_color="#FF0000")
+    result = await _call(
+        service, borders="all", border_style="solid", border_color="#FF0000"
+    )
 
     requests = sent_requests(service)
     assert len(requests) == 1
@@ -53,10 +55,7 @@ async def test_border_style_alone_sends_update_borders_on_all_sides():
             "style": "SOLID",
             "color": {"red": 1.0, "green": 0.0, "blue": 0.0},
         }
-    assert (
-        "SOLID borders #FF0000 on top, bottom, left, right, innerHorizontal, innerVertical"
-        in result
-    )
+    assert "SOLID borders (all) in #FF0000" in result
 
 
 @pytest.mark.asyncio
@@ -65,7 +64,10 @@ async def test_border_sides_outer_group_and_named_sides():
     await _call(service, border_style="DASHED", border_sides=["outer"])
     borders = sent_requests(service)[0]["updateBorders"]
     assert set(borders) == {"range", "top", "bottom", "left", "right"}
-    assert borders["top"] == {"style": "DASHED"}
+    assert borders["top"] == {
+        "style": "DASHED",
+        "color": {"red": 0.0, "green": 0.0, "blue": 0.0},
+    }
 
     service = service_with(TWO_SHEETS)
     await _call(
@@ -93,16 +95,18 @@ def test_normalize_border_sides_accepts_csv_string_and_dedupes():
 async def test_cell_format_is_sent_before_borders_and_merge():
     service = service_with(TWO_SHEETS)
 
-    result = await _call(service, bold=True, border_style="SOLID_THICK", merge="all")
+    result = await _call(
+        service, bold=True, borders="all", border_style="SOLID_THICK", merge="all"
+    )
 
     requests = sent_requests(service)
     assert [next(iter(r)) for r in requests] == [
         "repeatCell",
-        "updateBorders",
         "mergeCells",
+        "updateBorders",
     ]
-    assert requests[2]["mergeCells"] == {"range": GRID, "mergeType": "MERGE_ALL"}
-    assert "bold" in result and "merged all" in result
+    assert requests[1]["mergeCells"] == {"range": GRID, "mergeType": "MERGE_ALL"}
+    assert "bold" in result and "merged cells (MERGE_ALL)" in result
 
 
 @pytest.mark.asyncio
@@ -132,9 +136,9 @@ async def test_unmerge_sends_unmerge_cells():
     [
         ({"merge": "all", "unmerge": True}, "either merge or unmerge"),
         ({"merge": "diagonal"}, "merge must be one of"),
-        ({"border_style": "WAVY"}, "border_style must be one of"),
-        ({"border_color": "#000000"}, "border_style is required"),
-        ({}, "at least one formatting option"),
+        ({"borders": "all", "border_style": "WAVY"}, "border_style must be one of"),
+        ({"border_color": "#000000"}, "need borders"),
+        ({}, "at least one formatting or merge option"),
     ],
 )
 async def test_invalid_border_and_merge_input_is_refused(kwargs, message):

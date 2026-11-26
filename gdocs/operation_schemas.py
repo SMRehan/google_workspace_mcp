@@ -8,9 +8,18 @@ LLMs receive a machine-readable contract instead of a free-form object array.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Annotated, Any, Literal, Optional, Union
+from zoneinfo import available_timezones
 
-from pydantic import BaseModel, ConfigDict, Field, BeforeValidator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    BeforeValidator,
+    field_validator,
+    model_validator,
+)
 
 
 ParagraphBorderEdge = Literal["top", "bottom", "left", "right", "between"]
@@ -26,17 +35,7 @@ NamedStyleType = Literal[
     "HEADING_5",
     "HEADING_6",
 ]
-DateFormat = Literal[
-    "DATE_FORMAT_MONTH_DAY_ABBREVIATED",
-    "DATE_FORMAT_MONTH_DAY_FULL",
-    "DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED",
-    "DATE_FORMAT_ISO8601",
-]
-TimeFormat = Literal[
-    "TIME_FORMAT_DISABLED",
-    "TIME_FORMAT_HOUR_MINUTE",
-    "TIME_FORMAT_HOUR_MINUTE_TIMEZONE",
-]
+_IANA_TIME_ZONES = frozenset(available_timezones())
 
 
 def _coerce_json_str_to_list(v: Any) -> Any:
@@ -421,6 +420,78 @@ class InsertImageOperation(InsertionLocationOperation, SegmentTargetDocOperation
     height: Optional[int] = None
 
 
+class InsertPersonOperation(InsertionLocationOperation, SegmentTargetDocOperation):
+    type: Literal["insert_person"]
+    email: str = Field(
+        min_length=1,
+        description="Email of the person to @mention as a smart chip.",
+    )
+
+
+class InsertDateOperation(InsertionLocationOperation, SegmentTargetDocOperation):
+    type: Literal["insert_date"]
+    date: str = Field(
+        min_length=1,
+        description="YYYY-MM-DD, or an ISO 8601 timestamp with an offset (displayed in UTC unless timezone is set).",
+    )
+    date_format: Optional[
+        Literal[
+            "DATE_FORMAT_MONTH_DAY_ABBREVIATED",
+            "DATE_FORMAT_MONTH_DAY_FULL",
+            "DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED",
+            "DATE_FORMAT_ISO8601",
+        ]
+    ] = Field(
+        default=None,
+        description="Defaults to DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED.",
+    )
+    time_format: Optional[
+        Literal[
+            "TIME_FORMAT_DISABLED",
+            "TIME_FORMAT_HOUR_MINUTE",
+            "TIME_FORMAT_HOUR_MINUTE_TIMEZONE",
+        ]
+    ] = Field(default=None, description="Omit to show no time.")
+    timezone: Optional[str] = Field(
+        default=None,
+        description="IANA time zone ID shown on the chip. Requires time_format TIME_FORMAT_HOUR_MINUTE_TIMEZONE.",
+    )
+
+    @field_validator("date")
+    @classmethod
+    def _validate_date(cls, value: str) -> str:
+        """Accept YYYY-MM-DD or an ISO 8601 timestamp that carries a time zone."""
+        try:
+            if len(value) == 10:
+                datetime.strptime(value, "%Y-%m-%d")
+            else:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if "T" not in value or parsed.tzinfo is None:
+                    raise ValueError(value)
+        except ValueError as exc:
+            raise ValueError(
+                "date must be YYYY-MM-DD or an ISO 8601 timestamp with a time zone, "
+                "e.g. 2026-11-03T09:30:00Z"
+            ) from exc
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: Optional[str]) -> Optional[str]:
+        """Reject names the IANA time zone database does not know."""
+        if value is not None and value not in _IANA_TIME_ZONES:
+            raise ValueError(f"unknown IANA time zone: {value}")
+        return value
+
+    @model_validator(mode="after")
+    def validate_timezone_format(self) -> "InsertDateOperation":
+        if self.timezone and self.time_format != "TIME_FORMAT_HOUR_MINUTE_TIMEZONE":
+            raise ValueError(
+                "timezone requires time_format TIME_FORMAT_HOUR_MINUTE_TIMEZONE."
+            )
+        return self
+
+
 class InsertDocTabOperation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -443,40 +514,6 @@ class UpdateDocTabOperation(BaseModel):
     type: Literal["update_doc_tab"]
     tab_id: str
     title: str
-
-
-class InsertPersonOperation(InsertionLocationOperation, SegmentTargetDocOperation):
-    type: Literal["insert_person"]
-    email: str = Field(description="Email address the person chip links to.")
-    name: Optional[str] = Field(
-        default=None,
-        description="Display name shown in the chip instead of the email address.",
-    )
-
-
-class InsertDateOperation(InsertionLocationOperation, SegmentTargetDocOperation):
-    type: Literal["insert_date"]
-    date: str = Field(
-        description=(
-            "ISO 8601 date ('2026-10-08') or datetime ('2026-10-08T15:00:00Z'). "
-            "A bare date is midnight UTC; a naive datetime is treated as UTC."
-        )
-    )
-    date_format: Optional[DateFormat] = Field(
-        default=None,
-        description="Display format; the API default is DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED.",
-    )
-    time_format: Optional[TimeFormat] = Field(
-        default=None,
-        description="Time display; the API default is TIME_FORMAT_DISABLED.",
-    )
-    time_zone_id: Optional[str] = Field(
-        default=None,
-        description="CLDR time zone such as 'America/New_York' used to display the date.",
-    )
-    locale: Optional[str] = Field(
-        default=None, description="Language code such as 'en' for the display text."
-    )
 
 
 class InsertRichLinkOperation(InsertionLocationOperation, SegmentTargetDocOperation):
@@ -648,11 +685,11 @@ BatchDocOperation = Annotated[
         UpdateSectionStyleOperation,
         CreateHeaderFooterOperation,
         InsertImageOperation,
+        InsertPersonOperation,
+        InsertDateOperation,
         InsertDocTabOperation,
         DeleteDocTabOperation,
         UpdateDocTabOperation,
-        InsertPersonOperation,
-        InsertDateOperation,
         InsertRichLinkOperation,
         CreateFootnoteOperation,
         CreateDropdownDefinitionOperation,

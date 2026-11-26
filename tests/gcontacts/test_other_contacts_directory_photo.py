@@ -25,7 +25,7 @@ from gcontacts.contacts_helpers import (
     _format_person_page,
     _normalize_directory_sources,
     _normalize_read_mask,
-    _normalize_resource_name,
+    _other_contact_resource_name,
 )
 from gcontacts.contacts_tools import (
     DETAILED_PERSON_FIELDS,
@@ -61,17 +61,18 @@ def _person(resource="otherContacts/c1", name="Ada Lovelace", email="ada@x.io"):
 
 
 class TestHelpers:
-    def test_normalize_resource_name_adds_prefix(self):
-        assert _normalize_resource_name("c1") == "people/c1"
-        assert _normalize_resource_name("c1", "otherContacts") == "otherContacts/c1"
+    def test_other_contact_resource_name_adds_prefix(self):
+        assert _other_contact_resource_name("c1") == "otherContacts/c1"
+        assert _other_contact_resource_name(" otherContacts/c2 ") == "otherContacts/c2"
 
-    def test_normalize_resource_name_keeps_existing_collection(self):
-        assert _normalize_resource_name("otherContacts/c1") == "otherContacts/c1"
-        assert _normalize_resource_name(" people/c2 ") == "people/c2"
+    def test_other_contact_resource_name_rejects_other_collections(self):
+        with pytest.raises(UserInputError, match="otherContacts/"):
+            _other_contact_resource_name("people/c1")
 
-    def test_normalize_resource_name_rejects_empty(self):
-        with pytest.raises(UserInputError):
-            _normalize_resource_name("   ")
+    @pytest.mark.parametrize("value", ["   ", "otherContacts/c1/../c2", "c1?x=1"])
+    def test_other_contact_resource_name_rejects_unsafe_ids(self, value):
+        with pytest.raises(UserInputError, match="contact_id"):
+            _other_contact_resource_name(value)
 
     def test_normalize_read_mask_default_and_trim(self):
         assert _normalize_read_mask(None, "a,b") == "a,b"

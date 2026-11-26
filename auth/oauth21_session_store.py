@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - Windows
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import get_http_headers
 from google.oauth2.credentials import Credentials
-from auth.oauth_config import is_external_oauth21_provider, is_oauth21_enabled
+from auth.oauth_config import is_external_oauth21_provider
 
 logger = logging.getLogger(__name__)
 
@@ -630,18 +630,17 @@ class OAuth21SessionStore:
         # "rebind" error.
         if os.getenv("MCP_SINGLE_USER_MODE") == "1":
             mcp_session_id = None
-        # Legacy OAuth 2.0 mode (OAuth 2.1 off) is a single-operator deployment:
-        # one person's stored logins, selected per call by user_google_email.
-        # get_credentials already loads the requested user's credentials from the
-        # credential store when the session maps to someone else, so the binding
-        # protects nothing here. Enforcing it only makes a successful refresh of
-        # a second account's token fail with a false "rebind" error once the
-        # same long-lived MCP session (e.g. one HTTP client) has used another
-        # account. Keep the binding where it isolates users: OAuth 2.1 mode.
-        elif not is_oauth21_enabled():
-            mcp_session_id = None
 
         with self._lock:
+            bound_user = self._session_auth_binding.get(mcp_session_id)
+            if bound_user and bound_user != user_email:
+                logger.error(
+                    f"SECURITY: Attempt to rebind session {mcp_session_id} from {bound_user} to {user_email}"
+                )
+                raise ValueError(
+                    f"Session {mcp_session_id} is already bound to a different user"
+                )
+
             normalized_expiry = _normalize_expiry_to_naive_utc(expiry)
 
             # Clean up previous session mappings for this user before storing new one
@@ -693,14 +692,6 @@ class OAuth21SessionStore:
                     # on every request, so this fires per tool call.
                     logger.debug(
                         f"Created immutable session binding: {mcp_session_id} -> {user_email}"
-                    )
-                elif self._session_auth_binding[mcp_session_id] != user_email:
-                    # Security: Attempt to bind session to different user
-                    logger.error(
-                        f"SECURITY: Attempt to rebind session {mcp_session_id} from {self._session_auth_binding[mcp_session_id]} to {user_email}"
-                    )
-                    raise ValueError(
-                        f"Session {mcp_session_id} is already bound to a different user"
                     )
 
                 self._mcp_session_mapping[mcp_session_id] = user_email

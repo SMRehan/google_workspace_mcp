@@ -24,6 +24,7 @@ Performs a web search using the Google Custom Search JSON API.
 | language | string | no | | e.g. `lang_en` |
 | country | string | no | | e.g. `countryUS` |
 | sites | array | no | | List of domains, e.g. `["example.com"]` |
+| site_restrict | boolean | no | false | Use the Site Restricted JSON API (cse.siterestrict) instead of the standard endpoint. Only valid for engines that search 10 or fewer sites; it has no daily… |
 
 ### get_search_engine_info
 Retrieves metadata about the configured Programmable Search Engine, including its configuration and available refinements.

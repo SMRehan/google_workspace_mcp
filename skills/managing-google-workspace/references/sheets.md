@@ -6,6 +6,8 @@ MCP tools for reading, writing, formatting, and managing Google Sheets. All tool
 - Search & Info: list_spreadsheets, get_spreadsheet_info
 - Read & Write: read_sheet_values, modify_sheet_values
 - Create: create_spreadsheet, create_sheet, move_sheet_rows
+- Tabs & Dimensions: manage_sheet_tab, resize_sheet_dimensions
+- Tables: list_sheet_tables, append_table_rows
 - Formatting: format_sheet_range, manage_conditional_formatting
 - Named Ranges: manage_named_range
 - Comments: list_spreadsheet_comments, manage_spreadsheet_comment
@@ -22,6 +24,9 @@ List spreadsheets the user has access to (via Drive).
 |-----------|------|----------|---------|-------|
 | user_google_email | string | yes | | |
 | max_results | integer | no | 25 | |
+| page_token | string | no | | `nextPageToken` from a previous response |
+| corpora | string | no | | `user`, `domain`, `drive`, or `allDrives`. Defaults to `drive` when `drive_id` is set, else `allDrives` |
+| drive_id | string | no | | Shared drive ID to search |
 
 ### get_spreadsheet_info
 Get spreadsheet metadata: title, locale, and list of sheets.
@@ -37,6 +42,15 @@ Get spreadsheet metadata: title, locale, and list of sheets.
 
 ### read_sheet_values
 Read values from a range in a spreadsheet.
+
+The response has one line per row: the sheet row number, then the row's cells
+separated by tabs, starting at the range's first column (the line above the rows says
+which). Row numbers are the sheet's own, so reading `A41:G60` starts at row 41.
+If the API's response gives no A1 starting cell, rows are instead numbered from 1
+within the range, and the line above the rows says so.
+Trailing empty cells are dropped. Tabs, line breaks and backslashes inside a
+cell are shown as `\t`, `\n`, `\r` and `\\`, so `\\n` is a backslash
+followed by `n`, not a line break.
 
 Open-ended or oversized A1 ranges are clamped to at most **1000 rows** before
 the Sheets API request (same budget as the default `A1:Z1000`). When clamped,
@@ -54,22 +68,32 @@ Google Sheets can resolve them as named ranges.
 | include_notes | boolean | no | false | Fetch cell notes (slower) |
 | include_formulas | boolean | no | false | Fetch raw formula strings |
 | include_smart_chips | boolean | no | false | Fetch smart chips metadata (Drive files/folders & People) |
+| include_validation | boolean | no | false | Fetch data validation rules (dropdowns, checkboxes, ranges, formulas) |
+| ranges | array | no |  | Several A1 ranges to read in one values.batchGet call (e.g. ["Sheet1!A1:B10", "Summary!A1:D5"]). Each range is clamped to 1000 rows and formatted as its own… |
 
 ### modify_sheet_values
-Write, update, or clear values in a range, or insert Smart Chips (Drive files/folders or People). Chip writes are chunked into batches of <=8 chips to respect Google Sheets API limits.
+Write, update, or clear values in a range, write the rows of a local CSV/TSV file, insert Smart Chips (Drive files/folders or People), or copy another range into it. Chip writes are chunked into batches of <=8 chips to respect Google Sheets API limits.
 
-When providing `chips`, omit `values` and leave `clear_values=false`. `value_input_option` applies only to ordinary value writes.
+When providing `file_path`, `chips` or `source_range`, omit `values` and leave `clear_values=false`. `value_input_option` applies only to value writes (`values` or `file_path`).
+
+`file_path` loads a dataset into an existing, already-formatted sheet without passing every row inline. Point `range_name` at the top-left cell, e.g. `Sheet1!A2` to fill below a header row; to load into a new tab, add it with `create_sheet` first. To create a new spreadsheet from a file, or to convert XLSX/ODS, use `import_to_google_sheets`.
+
+`source_range` works like copy and paste in the Sheets UI: relative formula references shift and formatting comes along. `range_name` can be just the top-left destination cell, e.g. copy `Sheet1!A29:AO29` to `Sheet1!A30` to start a new row from the previous one.
 
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
 | user_google_email | string | yes | | |
 | spreadsheet_id | string | yes | | |
 | range_name | string | yes | | A1 notation |
-| values | array or string | conditional | | 2D array of values. Required unless `clear_values=true` or `chips` is set. Accepts a JSON string or a list |
+| values | array or string | conditional | | 2D array of values. Required unless `clear_values=true`, `file_path`, `chips`, or `source_range` is set. Accepts a JSON string or a list |
 | value_input_option | string | no | USER_ENTERED | `RAW` or `USER_ENTERED` |
 | clear_values | boolean | no | false | Clear the range instead of writing |
 | chips | array, object, or string | conditional | | Smart chips instead of `values`: single URL/email, 1D/2D array of URLs/emails, or dict(s) with `type`, `uri`/`email` |
 | chip_type | string | no | null | Optional override for `chips`: `drive` or `person` (auto-detected if omitted) |
+| source_range | string | conditional | | A1 range in the same spreadsheet to copy into `range_name` instead of `values`. Both must be A1 notation, not named ranges |
+| paste_type | string | no | PASTE_NORMAL | What `source_range` pastes: `PASTE_NORMAL`, `PASTE_VALUES`, `PASTE_FORMAT`, `PASTE_NO_BORDERS`, `PASTE_FORMULA`, `PASTE_DATA_VALIDATION`, `PASTE_CONDITIONAL_FORMATTING` |
+| file_path | string | conditional | | Local `.csv` or `.tsv` file (UTF-8) whose rows are written instead of `values`. Delimiter follows the extension. Local file access only |
+| append | boolean | no | false | If True, appends `values` (or the rows read from a local file) as new rows after the last row of the table at range_name (values.append) instead of overwriting… |
 
 ---
 
@@ -86,13 +110,16 @@ Create a new Google Spreadsheet.
 | folder_id | string | no | root | Parent folder. Accepts a folder ID or shortcut; for shared drives, a folder inside that drive. If the move fails, the spreadsheet is still created in My Drive root and the reply reports why |
 
 ### create_sheet
-Add a new sheet (tab) to an existing spreadsheet.
+Add a new sheet (tab) to an existing spreadsheet, or duplicate an existing tab when `source_sheet_name` is set. Set `destination_spreadsheet_id` too to copy the tab, with its formatting and formulas, into another spreadsheet.
 
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
 | user_google_email | string | yes | | |
 | spreadsheet_id | string | yes | | |
-| sheet_name | string | yes | | |
+| sheet_name | string | no | | Title of the new tab. Google picks a default name if omitted |
+| source_sheet_name | string | no | | Existing tab to duplicate instead of adding a blank one |
+| insert_sheet_index | integer | no | end | 0-based position for the new tab |
+| destination_spreadsheet_id | string | no | spreadsheet_id | Spreadsheet to copy `source_sheet_name` into. Requires `source_sheet_name` |
 
 ### move_sheet_rows
 Move rows from one sheet to another within the same spreadsheet. Preserves formulas, data types, and formatting.
@@ -108,10 +135,77 @@ Move rows from one sheet to another within the same spreadsheet. Preserves formu
 
 ---
 
+## Tabs & Dimensions
+
+### manage_sheet_tab
+Act on an existing tab: rename, delete, hide, unhide, reorder, or style it. Use `create_sheet` to add a tab and `resize_sheet_dimensions` for row and column changes.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| spreadsheet_id | string | yes | | |
+| sheet_name | string | yes | | Exact title of the tab to act on |
+| action | string | yes | | `rename`, `delete`, `hide`, `unhide`, `reorder`, or `style`. `delete` refuses to remove the last tab |
+| new_name | string | for rename | | New tab title |
+| new_index | integer | for reorder | | New 0-based position; must be less than the tab count |
+| tab_color | string | no | | `style` only: hex `#RRGGBB`, or `none` to remove the color |
+| show_gridlines | boolean | no | | `style` only: show or hide gridlines (grid sheets only). `style` needs this and/or `tab_color` |
+| destination_spreadsheet_id | string | no |  | Spreadsheet to copy the tab into, required for action="copy_to". Pass the same spreadsheet_id to duplicate within the file. The copy is appended as the last… |
+
+### resize_sheet_dimensions
+Change rows and columns on one tab in a single batch: pixel sizes, auto-fit, freezing, hiding, inserting, and deleting. Provide at least one operation. Rows are 1-based numbers and columns are letters; list and dict params accept JSON strings. Every row number and column letter refers to the tab as it was before the call: deletes apply before inserts, so an insert position is not shifted by deletions in the same call, and one inside a deleted span lands where that span was.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| spreadsheet_id | string | yes | | |
+| sheet_name | string | no | first sheet | Exact tab title |
+| column_sizes | object or string | no | | Column letter to pixel width, e.g. `{"A": 200, "C": 300}` |
+| row_sizes | object or string | no | | Row number to pixel height, e.g. `{"1": 40}` |
+| auto_resize_columns | array or string | no | | Column letters to fit to content, e.g. `["A", "B"]` |
+| auto_resize_rows | array or string | no | | Row numbers to fit to content |
+| frozen_row_count | integer | no | | Rows to freeze from the top; `0` unfreezes |
+| frozen_column_count | integer | no | | Columns to freeze from the left; `0` unfreezes |
+| hide_columns | array or string | no | | Column letters to hide |
+| unhide_columns | array or string | no | | Column letters to unhide |
+| hide_rows | array or string | no | | Row numbers to hide |
+| unhide_rows | array or string | no | | Row numbers to unhide |
+| insert_rows | integer | no | | Number of rows to insert |
+| insert_rows_at | integer | no | end | Row number to insert before. Appends to the sheet end if omitted |
+| insert_columns | integer | no | | Number of columns to insert |
+| insert_columns_at | string | no | end | Column letter to insert before, e.g. `C`. Appends if omitted |
+| delete_rows | array or string | no | | Row numbers to delete, best for scattered rows. Not with `delete_row_range` |
+| delete_row_range | string | no | | Contiguous rows as `start:end` (inclusive), e.g. `5:10`. Not with `delete_rows` |
+| delete_columns | array or string | no | | Column letters to delete |
+
+---
+
+## Tables
+
+### list_sheet_tables
+List structured tables in a spreadsheet with their IDs, names, sheets, ranges, and column names. Use it to find the `table_id` for `append_table_rows`.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| spreadsheet_id | string | yes | | |
+
+### append_table_rows
+Append rows to the end of a structured table, extending its range automatically.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| spreadsheet_id | string | yes | | |
+| table_id | string | yes | | From `list_sheet_tables` |
+| values | array or string | yes | | 2D array, one inner list per row. JSON string or list. Strings starting with `=` are written as formulas |
+
+---
+
 ## Formatting
 
 ### format_sheet_range
-Apply visual formatting to a range: colors, number formats, text wrapping, alignment, and text styling.
+Apply visual formatting to a range: colors, number formats, text wrapping, alignment, text styling, cell merging, borders, and dropdown lists.
 
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
@@ -128,6 +222,17 @@ Apply visual formatting to a range: colors, number formats, text wrapping, align
 | bold | boolean | no | | |
 | italic | boolean | no | | |
 | font_size | integer | no | | Size in points |
+| merge_cells | boolean | no | | `true` to merge, `false` to unmerge; merging keeps only the top-left value |
+| merge_type | string | no | | `MERGE_ALL` (default when merging), `MERGE_COLUMNS`, or `MERGE_ROWS`; implies a merge |
+| borders | string | no | | Sides to draw, comma-separated: `all`, `outer`, `inner`, `top`, `bottom`, `left`, `right`, `inner_horizontal`, `inner_vertical`. `none` removes all borders |
+| border_style | string | no | `SOLID` | `SOLID`, `SOLID_MEDIUM`, `SOLID_THICK`, `DASHED`, `DOTTED`, `DOUBLE`. Requires `borders` |
+| border_color | string | no | `#000000` | Hex `#RRGGBB`. Requires `borders` |
+| dropdown_values | string[] | no | | Turns each cell into a dropdown with these values |
+| dropdown_strict | boolean | no | `true` | `false` only warns on other input. Requires `dropdown_values` |
+| clear_dropdown | boolean | no | | Removes all data validation from the range, including checkboxes |
+| border_sides | string/array | no |  | List form of borders: any of top, bottom, left, right, innerHorizontal, innerVertical, or the groups "all" (default), "outer", "inner". Cannot be combined with… |
+| merge | string | no |  | Shorthand for merge_type - "all" (one cell), "columns" (merge each column vertically) or "rows" (merge each row horizontally). Values other than the top-left… |
+| unmerge | boolean | no | false | Shorthand for merge_cells=False: unmerge every merged cell in the range. Defaults to False. |
 
 ### manage_conditional_formatting
 Add, update, or delete conditional formatting rules.
@@ -175,18 +280,20 @@ List all comments on a spreadsheet.
 |-----------|------|----------|---------|-------|
 | user_google_email | string | yes | | |
 | spreadsheet_id | string | yes | | |
+| max_comments | integer | no | 100 | Cap on comments returned; must be at least 1. Default comes from `WORKSPACE_MCP_COMMENTS_MAX`; unset, invalid, or non-positive values fall back to 100 |
 
 ### manage_spreadsheet_comment
-Create, reply to, or resolve a comment.
+Create, reply to, resolve, edit, or delete a comment.
 
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
 | user_google_email | string | yes | | |
 | spreadsheet_id | string | yes | | |
-| action | string | yes | | `create`, `reply`, or `resolve` |
-| comment_content | string | for create/reply | | Comment text |
-| comment_id | string | for reply/resolve | | Target comment ID |
+| action | string | yes | | `create`, `reply`, `resolve`, `update`, or `delete` |
+| comment_content | string | for create/reply/update | | Comment text |
+| comment_id | string | for reply/resolve/update/delete | | Target comment ID |
 | cell | string | no | | Single cell in A1 notation (e.g. `Sheet1!B2`) to anchor a `create` comment to. Omit for a file-level comment |
+| reply_id | string | no | |  |
 
 ---
 
@@ -199,3 +306,109 @@ Create, reply to, or resolve a comment.
 **Conditional formatting condition types**: Common values include `NUMBER_GREATER`, `NUMBER_LESS`, `NUMBER_BETWEEN`, `TEXT_CONTAINS`, `TEXT_NOT_CONTAINS`, `DATE_BEFORE`, `DATE_AFTER`, `CUSTOM_FORMULA`, `BLANK`, `NOT_BLANK`.
 
 **Gradient rules**: Provide `gradient_points` as a list of dicts, each with `type` (`MIN`, `MAX`, `NUMBER`, `PERCENT`, `PERCENTILE`), `value` (string, optional for `MIN`/`MAX`), and `color` (hex `#RRGGBB`). When gradient points are set, boolean formatting parameters are ignored.
+
+### batch_update_sheet
+Apply raw Sheets API batchUpdate requests to a spreadsheet.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes |  | The user's Google email address. Required. |
+| spreadsheet_id | string | yes |  | The ID of the spreadsheet to update. Required. |
+| requests | array | yes |  | Requests to apply in order, e.g. [{"addSheet": {"properties": {"title": "Q3"}}}, {"deleteDimension": {"range": {"sheetId": 0, "dimension": "ROWS",… |
+
+### manage_sheet_filter
+Manage a sheet's basic filter and its saved filter views.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes |  | The user's Google email address. Required. |
+| spreadsheet_id | string | yes |  | The ID of the spreadsheet. Required. |
+| action | string | yes |  | One of: - "set_basic": set the sheet's basic filter on range_name (replaces any existing basic filter) with optional sort_specs / filter_specs. -… |
+| sheet_name | string | no |  | Sheet to act on; defaults to the first sheet. A sheet prefix inside range_name takes precedence. |
+| range_name | string | no |  | A1 range the filter covers, e.g. "A1:F200". Required for set_basic and create_view. Omitted sheet uses sheet_name. |
+| title | string | no |  | Filter view title (create_view requires it). |
+| filter_view_id | integer | no |  | Target view for update_view / delete_view. |
+| sort_specs | array | no |  | Sort order, applied in sequence, e.g. [{"column": "C", "order": "DESCENDING"}, {"column": "A"}]. Columns are sheet columns as letters or zero-based indexes;… |
+| filter_specs | array | no |  | Per-column criteria, e.g. [{"column": "B", "hidden_values": ["Closed", "Lost"]}, {"column": "D", "condition_type": "NUMBER_GREATER", "condition_values":… |
+
+### manage_sheet_protection
+List, add, update or delete protected ranges (and protected sheets).
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes |  | The user's Google email address. Required. |
+| spreadsheet_id | string | yes |  | The ID of the spreadsheet. Required. |
+| action | string | yes |  | "list", "add", "update" or "delete". |
+| sheet_name | string | no |  | Sheet to protect, or the sheet range_name refers to; defaults to the first sheet. For "add" without range_name the whole sheet is protected. |
+| range_name | string | no |  | A1 range to protect, e.g. "A1:D20" or "Totals!A1:D20". |
+| protected_range_id | integer | no |  | Target for "update" / "delete" (see "list"). |
+| description | string | no |  | Label shown in the Sheets UI. |
+| warning_only | boolean | no |  | True shows a warning but lets anyone edit; False (default on add) restricts edits to the editors below. |
+| editors | array | no |  | Emails of users allowed to edit. The spreadsheet owner and the caller can always edit. |
+| editor_groups | array | no |  | Emails of groups allowed to edit. |
+| domain_users_can_edit | boolean | no |  | Allow anyone in the domain to edit. |
+| unprotected_ranges | array | no |  | A1 ranges inside the protected area that stay editable (only valid when protecting a whole sheet). |
+
+### manage_sheet_validation
+Set or clear data validation on a range (dropdowns, checkboxes, number/date/text rules).
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes |  | The user's Google email address. Required. |
+| spreadsheet_id | string | yes |  | The ID of the spreadsheet. Required. |
+| range_name | string | yes |  | A1 range to validate, e.g. "Sheet1!C2:C100". Required. |
+| action | string | no | "set" | "set" (default) applies a rule; "clear" removes validation. |
+| rule_type | string | no |  | Required for "set". One of: - "list": dropdown of `values` (e.g. ["Open", "Closed"]). - "range": dropdown from a range; values=["=Lists!A2:A20"]. - "checkbox":… |
+| values | string/array | no |  | Rule operands as described above; a JSON string is accepted. |
+| condition_type | string | no |  | Comparison for number/date/text rules. |
+| strict | boolean | no | true | Reject invalid input (True, default) or only warn (False). |
+| show_dropdown | boolean | no | true | For list/range rules, show the in-cell dropdown arrow. Defaults to True. |
+| input_message | string | no |  | Help text shown when the cell is selected. |
+
+### manage_sheet_chart
+List, add, update, move/resize or delete embedded charts.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes |  | The user's Google email address. Required. |
+| spreadsheet_id | string | yes |  | The ID of the spreadsheet. Required. |
+| action | string | yes |  | One of: - "list": every chart with its ID, title, type and placement. - "add": create a chart from domain_range + series_ranges, placed at anchor_cell (or on… |
+| chart_id | integer | no |  | Target chart for update / move / delete. |
+| chart_type | string | no |  | BAR, COLUMN, LINE, AREA, SCATTER or PIE. Required for "add". |
+| title | string | no |  | Chart title. |
+| subtitle | string | no |  | Chart subtitle. |
+| domain_range | string | no |  | A1 range of the categories / x-axis labels, e.g. "Data!A1:A13" (include the header row and set header_count=1). Required for "add". |
+| series_ranges | array | no |  | One A1 range per data series, e.g. ["Data!B1:B13", "Data!C1:C13"]. PIE takes exactly one. Required for "add". |
+| anchor_cell | string | no |  | Top-left cell the chart floats over, e.g. "Data!E2". For "add" omitting it puts the chart on a new sheet. |
+| width | integer | no |  | Chart width in pixels (default 600 on add). |
+| height | integer | no |  | Chart height in pixels (default 371 on add). |
+| legend_position | string | no |  | BOTTOM, TOP, LEFT, RIGHT, NONE, or LABELED (pie only). |
+| header_count | integer | no |  | Rows of the ranges that are headers (series names). Sheets guesses when omitted. |
+
+### sort_sheet_range
+Sort the rows of a range by one or more columns (sortRange).
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes |  | The user's Google email address. Required. |
+| spreadsheet_id | string | yes |  | The ID of the spreadsheet. Required. |
+| range_name | string | yes |  | A1 range whose rows are sorted, e.g. "Sheet1!A1:F200". Rows move as whole rows within the range only; columns outside it are not reordered, so include every… |
+| sort_specs | array | yes |  | Sort keys in priority order, e.g. [{"column": "C", "order": "DESCENDING"}, {"column": "A"}]. "column" is a sheet column as letters or a zero-based index and… |
+| has_header | boolean | no | false | True keeps the first row of the range in place and sorts the rows below it. Defaults to False. |
+
+### find_replace_sheet
+Find and replace text across a range, one sheet, or the whole spreadsheet.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes |  | The user's Google email address. Required. |
+| spreadsheet_id | string | yes |  | The ID of the spreadsheet. Required. |
+| find | string | yes |  | Text (or regex when search_by_regex=True) to find. Required. |
+| replacement | string | no | "" | Replacement text; with search_by_regex, $1..$9 refer to capture groups. Defaults to "" (delete the match). |
+| sheet_name | string | no |  | Limit to one sheet; defaults to the first sheet unless range_name or all_sheets is given. |
+| range_name | string | no |  | Limit to an A1 range, e.g. "Sheet1!B2:B500". Takes precedence over sheet_name / all_sheets. |
+| all_sheets | boolean | no | false | Search every sheet. Defaults to False. |
+| match_case | boolean | no | false | Case-sensitive match. Defaults to False. |
+| match_entire_cell | boolean | no | false | Only replace when the whole cell matches. Defaults to False. |
+| search_by_regex | boolean | no | false | Treat `find` as a regular expression (RE2 syntax). Defaults to False. |
+| include_formulas | boolean | no | false | Also search inside formulas, not just values. Defaults to False. |

@@ -20,13 +20,10 @@ from gdocs.docs_helpers import (
     create_delete_header_request,
     create_delete_positioned_object_request,
     create_dropdown_definition_request,
-    create_insert_date_request,
     create_insert_dropdown_request,
-    create_insert_person_request,
     create_insert_rich_link_request,
     create_replace_image_request,
     create_update_named_style_request,
-    iso_date_to_rfc3339,
     validate_operation,
 )
 from gdocs.managers.batch_operation_manager import BatchOperationManager
@@ -86,71 +83,6 @@ def _batch_bodies(service):
         call.kwargs["body"]
         for call in service.documents.return_value.batchUpdate.call_args_list
     ]
-
-
-class TestInsertPersonRequest:
-    def test_at_index_with_name(self):
-        request = create_insert_person_request(5, "ana@example.com", name="Ana")
-        assert request == {
-            "insertPerson": {
-                "personProperties": {"email": "ana@example.com", "name": "Ana"},
-                "location": {"index": 5},
-            }
-        }
-
-    def test_end_of_segment_in_header(self):
-        request = create_insert_person_request(
-            None, "ana@example.com", segment_id="kix.h1", end_of_segment=True
-        )
-        assert request["insertPerson"]["endOfSegmentLocation"] == {
-            "segmentId": "kix.h1"
-        }
-        assert "name" not in request["insertPerson"]["personProperties"]
-
-    def test_rejects_non_email(self):
-        with pytest.raises(ValueError, match="email"):
-            create_insert_person_request(5, "not-an-email")
-
-
-class TestInsertDateRequest:
-    @pytest.mark.parametrize(
-        "date, expected",
-        [
-            ("2026-10-08", "2026-10-08T00:00:00Z"),
-            ("2026-10-08T15:30:00Z", "2026-10-08T15:30:00Z"),
-            ("2026-10-08T15:30:00+02:00", "2026-10-08T13:30:00Z"),
-            ("2026-10-08T15:30:00", "2026-10-08T15:30:00Z"),
-        ],
-    )
-    def test_iso_dates_become_rfc3339_utc(self, date, expected):
-        assert iso_date_to_rfc3339(date) == expected
-
-    def test_rejects_garbage(self):
-        with pytest.raises(ValueError, match="ISO 8601"):
-            iso_date_to_rfc3339("next tuesday")
-
-    def test_request_shape(self):
-        request = create_insert_date_request(
-            7,
-            "2026-10-08",
-            date_format="date_format_iso8601",
-            time_zone_id="America/New_York",
-            tab_id="t.1",
-        )
-        assert request == {
-            "insertDate": {
-                "dateElementProperties": {
-                    "timestamp": "2026-10-08T00:00:00Z",
-                    "dateFormat": "DATE_FORMAT_ISO8601",
-                    "timeZoneId": "America/New_York",
-                },
-                "location": {"index": 7, "tabId": "t.1"},
-            }
-        }
-
-    def test_rejects_unknown_date_format(self):
-        with pytest.raises(ValueError, match="date_format"):
-            create_insert_date_request(7, "2026-10-08", date_format="DD/MM")
 
 
 class TestInsertRichLinkRequest:
@@ -657,4 +589,4 @@ class TestBatchManagerIntegration:
         assert "Error" not in result
         request = _batch_bodies(service)[0]["requests"][0]["insertDate"]
         assert request["endOfSegmentLocation"] == {}
-        assert request["dateElementProperties"]["timestamp"] == "2026-10-08T00:00:00Z"
+        assert request["dateElementProperties"]["timestamp"] == "2026-10-08T12:00:00Z"

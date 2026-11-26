@@ -16,7 +16,12 @@ from mcp.types import ToolAnnotations
 
 from auth.service_decorator import require_google_service
 from core.server import server
-from core.utils import handle_http_errors, UserInputError, StringList
+from core.utils import (
+    handle_http_errors,
+    hide_local_file_args,
+    UserInputError,
+    StringList,
+)
 from core.comments import create_comment_tools
 from gdrive.drive_helpers import flag_incomplete_search, move_new_file_to_folder
 from gsheets.sheets_helpers import (
@@ -25,22 +30,32 @@ from gsheets.sheets_helpers import (
     _a1_range_for_values,
     _clamp_a1_read_rows,
     _column_to_index,
+    _copy_paste_range,
+    _copy_sheet_to_spreadsheet,
     _build_boolean_rule,
+    _build_tab_style_properties,
+    _build_update_borders_request,
+    _build_dropdown_request,
     _build_gradient_rule,
+    _build_merge_request,
     _fetch_cell_formulas,
     _fetch_detailed_sheet_errors,
     _fetch_grid_metadata,
     _fetch_sheets_with_rules,
+    _fetch_validation_section,
     _find_named_range,
     _format_conditional_rules_section,
     _format_named_ranges_list,
     _format_sheet_error_section,
+    _format_sheet_values_rows,
     _insert_cell_comment,
     _normalize_chips_input,
+    _normalize_merge_type,
     _parse_a1_range,
     _parse_condition_values,
     _parse_gradient_points,
     _parse_hex_color,
+    _read_delimited_file_values,
     _select_sheet,
     _values_contain_sheets_errors,
     _apply_chart_spec_updates,
@@ -50,9 +65,9 @@ from gsheets.sheets_helpers import (
     _build_embedded_object_position_update,
     _build_filter_body,
     _build_find_replace_request,
-    _build_merge_cells_request,
     _build_protected_range,
-    _build_update_borders_request,
+    _merge_alias_to_type,
+    _normalize_border_sides,
     _fetch_sheets,
     _find_chart,
     _format_charts_list,
@@ -257,11 +272,13 @@ async def read_sheet_values(
     include_notes: bool = False,
     include_formulas: bool = False,
     include_smart_chips: bool = False,
+    include_validation: bool = False,
     ranges: Optional[List[str]] = None,
 ) -> str:
     """
-    Reads values from a specific range in a Google Sheet, or from several
-    ranges at once.
+    Reads values from a specific range in a Google Sheet, one line per row:
+    the sheet row number, then the row's cells separated by tabs. Pass `ranges`
+    to read several ranges at once.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -283,9 +300,12 @@ async def read_sheet_values(
             back to a range. Defaults to False to avoid an extra API request.
         include_smart_chips (bool): If True, also fetch smart chips metadata (Drive files/folders
             and People chips) for the range. Defaults to False to avoid expensive includeGridData requests.
+        include_validation (bool): If True, also fetch data validation rules (dropdowns,
+            checkboxes, ranges, custom formulas) for the range. Defaults to False to avoid
+            expensive includeGridData requests.
 
     Returns:
-        str: The formatted values from the specified range.
+        str: The formatted values, with trailing empty cells dropped.
     """
     logger.info(
         f"[read_sheet_values] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Range: {range_name}"
@@ -303,6 +323,7 @@ async def read_sheet_values(
                     include_notes,
                     include_formulas,
                     include_smart_chips,
+                    include_validation,
                 ]
             ),
         )
@@ -336,6 +357,12 @@ async def read_sheet_values(
         include_smart_chips=include_smart_chips,
     )
 
+    validation_section = ""
+    if include_validation:
+        validation_section = await _fetch_validation_section(
+            service, spreadsheet_id, resolved_range, values
+        )
+
     formula_section = ""
     formula_values = []
     if include_formulas:
@@ -344,8 +371,10 @@ async def read_sheet_values(
         )
 
     if not values and not formula_values:
-        return f"No data found in range '{range_name}' for {user_google_email}." + (
-            clamp_note or ""
+        return (
+            f"No data found in range '{range_name}' for {user_google_email}."
+            + (clamp_note or "")
+            + validation_section
         )
 
     if not values:
@@ -358,6 +387,7 @@ async def read_sheet_values(
             f"for {user_google_email}. The range contains formula cells."
             + formula_section
             + (clamp_note or "")
+            + validation_section
         )
 
     detailed_range = _a1_range_for_values(resolved_range, values) or resolved_range
@@ -378,16 +408,9 @@ async def read_sheet_values(
                 exc,
             )
 
-    # Format the output as a readable table
-    formatted_rows = []
-    for i, row in enumerate(values, 1):
-        # Pad row with empty strings to show structure
-        padded_row = row + [""] * max(0, len(values[0]) - len(row)) if values else row
-        formatted_rows.append(f"Row {i:2d}: {padded_row}")
-
     text_output = (
         f"Successfully read {len(values)} rows from range '{range_name}' in spreadsheet {spreadsheet_id} for {user_google_email}:\n"
-        + "\n".join(formatted_rows)
+        + _format_sheet_values_rows(result.get("range", ""), values)
     )
     if clamp_note:
         text_output += clamp_note
@@ -400,6 +423,7 @@ async def read_sheet_values(
         + formula_section
         + detailed_errors_section
         + smart_chips_section
+        + validation_section
     )
 
 
@@ -416,8 +440,9 @@ async def _read_sheet_value_ranges(
         raise UserInputError("ranges must contain at least one A1 range.")
     if metadata_requested:
         raise UserInputError(
-            "include_hyperlinks, include_notes, include_formulas and include_smart_chips "
-            "are not supported with `ranges`; read a single range_name for those."
+            "include_hyperlinks, include_notes, include_formulas, include_smart_chips and "
+            "include_validation are not supported with `ranges`; read a single range_name "
+            "for those."
         )
 
     fetch_ranges = []
@@ -463,6 +488,7 @@ async def _read_sheet_value_ranges(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
 @handle_http_errors("modify_sheet_values", service_type="sheets")
 @require_google_service("sheets", "sheets_write")
 async def modify_sheet_values(
@@ -475,11 +501,14 @@ async def modify_sheet_values(
     clear_values: bool = False,
     chips: Optional[Union[str, dict, List[Any]]] = None,
     chip_type: Optional[str] = None,
+    source_range: Optional[str] = None,
+    paste_type: str = "PASTE_NORMAL",
+    file_path: Optional[str] = None,
     append: bool = False,
 ) -> str:
     """
     Modifies values in a specific range of a Google Sheet - can write, update, append, or clear
-    values, or insert Smart Chips (Drive files/folders or People).
+    values, insert Smart Chips (Drive files/folders or People), or copy another range into it.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -487,12 +516,13 @@ async def modify_sheet_values(
         range_name (str): The range to modify (e.g., "Sheet1!A1:D10", "A1:D10"). Required.
             With append=True this is the table to append to; the API finds the
             first empty row after it (e.g. "Sheet1!A:D" or "Sheet1").
-        values (Optional[Union[str, List[List[str]]]]): 2D array of values to write/update. Can be a JSON string or Python list. Required unless clear_values=True or chips is provided.
+        values (Optional[Union[str, List[List[str]]]]): 2D array of values to write/update. Can be a JSON string or Python list. Required unless clear_values=True or chips or source_range is provided.
         value_input_option (str): How to interpret input values ("RAW" or "USER_ENTERED"). Defaults to "USER_ENTERED".
         clear_values (bool): If True, clears the range instead of writing values. Defaults to False.
-        append (bool): If True, appends `values` as new rows after the last row of
-            the table at range_name (values.append) instead of overwriting the
-            range. Cannot be combined with clear_values or chips. Defaults to False.
+        append (bool): If True, appends `values` (or the rows read from a local file) as
+            new rows after the last row of the table at range_name (values.append)
+            instead of overwriting the range. Cannot be combined with clear_values,
+            chips or source_range. Defaults to False.
         chips (Optional[Union[str, dict, List[Any]]]): Smart chip(s) to insert instead of values:
             - A single URL or email string for a single cell (e.g., "https://drive.google.com/drive/folders/123", "user@example.com").
             - A list of URLs or emails for a single cell (multiple chips) or across cells (e.g., ["https://...", "https://..."]).
@@ -502,12 +532,54 @@ async def modify_sheet_values(
             - A dict or list of dicts with explicit properties (e.g., {"type": "drive", "uri": "..."}, {"type": "person", "email": "..."}).
             - A JSON-encoded string representing any of the above formats.
         chip_type (Optional[str]): Explicit chip type if passing raw strings in chips: "drive" (default for URLs/IDs) or "person" (default for emails).
+        source_range (Optional[str]): A1 range in the same spreadsheet to copy into range_name, like the UI copy and
+            paste: relative formula references shift and formatting comes along. Both ranges must be A1 notation (not
+            named ranges); one without a sheet name uses the first sheet. range_name may be just the top-left cell
+            (e.g., copy "Sheet1!A29:AO29" to "Sheet1!A30"). Use instead of values, chips, or clear_values.
+        paste_type (str): What source_range pastes: "PASTE_NORMAL" (values, formulas, formatting), "PASTE_VALUES",
+            "PASTE_FORMAT", "PASTE_NO_BORDERS", "PASTE_FORMULA", "PASTE_DATA_VALIDATION", or
+            "PASTE_CONDITIONAL_FORMATTING". Defaults to "PASTE_NORMAL".
+        file_path (Optional[str]): Local .csv or .tsv file (UTF-8) whose rows are written instead of values,
+            with value_input_option applied. range_name may be just the top-left cell (e.g., "Sheet1!A2"
+            to load below a header row). Use instead of values, chips, source_range, or clear_values.
 
     Returns:
         str: Confirmation message of the successful modification operation.
     """
     if append and clear_values:
         raise UserInputError("append=True cannot be combined with clear_values=True.")
+    if append and source_range is not None:
+        raise UserInputError("append=True cannot be combined with source_range.")
+
+    if file_path is not None:
+        if (
+            values is not None
+            or clear_values
+            or chips is not None
+            or source_range is not None
+        ):
+            raise UserInputError(
+                "Provide only one of 'values', 'file_path', 'chips', 'source_range', "
+                "or 'clear_values'."
+            )
+        values = await asyncio.to_thread(_read_delimited_file_values, file_path)
+        logger.info(
+            f"[modify_sheet_values] Read {len(values)} rows from file_path for range {range_name}"
+        )
+
+    if source_range is not None:
+        if values is not None or clear_values or chips is not None:
+            raise UserInputError(
+                "Provide only one of 'values', 'chips', 'source_range', or 'clear_values'."
+            )
+        applied_paste_type = await _copy_paste_range(
+            service, spreadsheet_id, source_range, range_name, paste_type
+        )
+        return (
+            f"Successfully copied '{source_range}' to '{range_name}' ({applied_paste_type}) "
+            f"in spreadsheet {spreadsheet_id} for {user_google_email}."
+        )
+
     if chips is not None:
         if values is not None or clear_values:
             raise UserInputError(
@@ -554,7 +626,7 @@ async def modify_sheet_values(
 
     if not clear_values and not values:
         raise UserInputError(
-            "Either 'values' or 'chips' must be provided, or 'clear_values' must be True."
+            "Provide 'values' or 'chips' or 'source_range', or set 'clear_values' to True."
         )
 
     if clear_values:
@@ -776,16 +848,23 @@ async def _format_sheet_range_impl(
     bold: Optional[bool] = None,
     italic: Optional[bool] = None,
     font_size: Optional[int] = None,
+    merge_cells: Optional[bool] = None,
+    merge_type: Optional[str] = None,
+    borders: Optional[str] = None,
     border_style: Optional[str] = None,
     border_color: Optional[str] = None,
-    border_sides: Optional[List[str]] = None,
+    dropdown_values: Optional[List[str]] = None,
+    dropdown_strict: Optional[bool] = None,
+    clear_dropdown: Optional[bool] = None,
+    border_sides: Optional[Union[str, List[str]]] = None,
     merge: Optional[str] = None,
     unmerge: bool = False,
 ) -> dict:
     """Internal implementation for format_sheet_range.
 
     Applies formatting to a Google Sheets range including colors, number formats,
-    text wrapping, alignment, text styling, borders and cell merging.
+    text wrapping, alignment, text styling, cell merging/unmerging, borders, and
+    dropdown lists.
 
     Args:
         service: Google Sheets API service client.
@@ -801,20 +880,60 @@ async def _format_sheet_range_impl(
         bold: Whether to apply bold formatting.
         italic: Whether to apply italic formatting.
         font_size: Font size in points.
-        border_style: Border style (SOLID, SOLID_MEDIUM, SOLID_THICK, DASHED,
-            DOTTED, DOUBLE, NONE) applied to border_sides.
-        border_color: Hex border color; defaults to the Sheets default (black).
-        border_sides: Sides to apply the border to; defaults to all.
-        merge: Merge the range: "all", "columns" or "rows".
-        unmerge: Unmerge any merged cells in the range.
+        merge_cells: True merges the range, False unmerges it.
+        merge_type: MERGE_ALL (default), MERGE_COLUMNS, or MERGE_ROWS; implies a merge.
+        borders: Comma-separated border sides (all, outer, inner, top, bottom,
+            left, right, inner_horizontal, inner_vertical), or "none".
+        border_style: Border line style (SOLID, SOLID_MEDIUM, SOLID_THICK,
+            DASHED, DOTTED, DOUBLE). Defaults to SOLID.
+        border_color: Hex border color. Defaults to black.
+        dropdown_values: Values offered as a dropdown list in every cell.
+        dropdown_strict: Reject other values (default True) or only warn.
+        clear_dropdown: Remove all data validation (dropdowns, checkboxes,
+            other rules) from the range.
+        border_sides: Alias for borders as a list (or JSON/CSV string) of sides;
+            defaults to all sides. Cannot be combined with borders.
+        merge: Alias for merge_type: "all", "columns" or "rows" (or MERGE_*).
+        unmerge: Alias for merge_cells=False.
 
     Returns:
         Dictionary with keys: range_name, spreadsheet_id, summary.
     """
-    if (border_color or border_sides) and not border_style:
+    # Fork aliases (border_sides, merge, unmerge) map onto the upstream options.
+    if border_sides is not None:
+        if borders:
+            raise UserInputError("Provide either borders or border_sides, not both.")
+        borders = ",".join(_normalize_border_sides(border_sides))
+    if unmerge:
+        if merge or merge_type or merge_cells is True:
+            raise UserInputError("Provide either merge or unmerge, not both.")
+        merge_cells = False
+    if merge:
+        alias_type = _merge_alias_to_type(merge)
+        if merge_type and merge_type.strip().upper() != alias_type:
+            raise UserInputError("merge and merge_type disagree; pass only one.")
+        merge_type = alias_type
+
+    if (border_style or border_color) and not borders:
         raise UserInputError(
-            "border_style is required when border_color or border_sides is given."
+            "border_style and border_color need borders to say which sides to draw."
         )
+    border_request = None
+    border_summary = None
+    if borders:
+        border_request, border_summary = _build_update_borders_request(
+            borders, border_style, border_color
+        )
+    wants_dropdown = dropdown_values is not None or bool(clear_dropdown)
+    if dropdown_strict is not None and dropdown_values is None:
+        raise UserInputError("dropdown_strict needs dropdown_values.")
+    dropdown_request = None
+    dropdown_summary = None
+    if wants_dropdown:
+        dropdown_request, dropdown_summary = _build_dropdown_request(
+            dropdown_values, dropdown_strict, clear_dropdown
+        )
+
     # Validate at least one formatting option is provided
     has_any_format = any(
         [
@@ -827,19 +946,21 @@ async def _format_sheet_range_impl(
             bold is not None,
             italic is not None,
             font_size is not None,
-            border_style,
-            merge,
-            unmerge,
+            merge_cells is not None,
+            merge_type is not None,
+            borders,
+            wants_dropdown,
         ]
     )
     if not has_any_format:
         raise UserInputError(
-            "Provide at least one formatting option (background_color, text_color, "
+            "Provide at least one formatting or merge option (background_color, text_color, "
             "number_format_type, wrap_strategy, horizontal_alignment, vertical_alignment, "
-            "bold, italic, font_size, border_style, merge, or unmerge)."
+            "bold, italic, font_size, merge_cells, merge_type, borders, dropdown_values, "
+            "or clear_dropdown)."
         )
-    if merge and unmerge:
-        raise UserInputError("Provide either merge or unmerge, not both.")
+
+    normalized_merge_type = _normalize_merge_type(merge_cells, merge_type)
 
     # Parse colors
     bg_color_parsed = _parse_hex_color(background_color)
@@ -963,7 +1084,6 @@ async def _format_sheet_range_impl(
         user_entered_format["verticalAlignment"] = v_align_normalized
         fields.append("userEnteredFormat.verticalAlignment")
 
-    # Build and execute request(s): cell format first, then borders, then merges
     requests = []
     if user_entered_format:
         requests.append(
@@ -975,22 +1095,25 @@ async def _format_sheet_range_impl(
                 }
             }
         )
-    borders_request = None
-    if border_style:
-        borders_request = _build_update_borders_request(
-            grid_range, border_style, border_color, border_sides
+    if normalized_merge_type:
+        requests.append(
+            _build_merge_request(grid_range, range_name, normalized_merge_type)
         )
-        requests.append(borders_request)
-    if unmerge:
+    elif merge_cells is False:
         requests.append({"unmergeCells": {"range": grid_range}})
-    if merge:
-        requests.append(_build_merge_cells_request(grid_range, merge))
+    if border_request:
+        border_request["updateBorders"]["range"] = grid_range
+        requests.append(border_request)
+    if dropdown_request:
+        dropdown_request["setDataValidation"]["range"] = grid_range
+        requests.append(dropdown_request)
 
     if not requests:
         raise UserInputError(
-            "No formatting applied. Verify provided formatting options."
+            "No formatting or merge action applied. Verify provided options."
         )
 
+    # Build and execute request
     request_body = {"requests": requests}
 
     await asyncio.to_thread(
@@ -1022,16 +1145,14 @@ async def _format_sheet_range_impl(
         applied_parts.append("italic" if italic else "not italic")
     if font_size is not None:
         applied_parts.append(f"font size {font_size}")
-    if borders_request:
-        sides = [k for k in borders_request["updateBorders"] if k != "range"]
-        border_desc = f"{border_style.strip().upper()} borders"
-        if border_color:
-            border_desc += f" {border_color}"
-        applied_parts.append(f"{border_desc} on {', '.join(sides)}")
-    if unmerge:
+    if normalized_merge_type:
+        applied_parts.append(f"merged cells ({normalized_merge_type})")
+    elif merge_cells is False:
         applied_parts.append("unmerged cells")
-    if merge:
-        applied_parts.append(f"merged {merge.strip().lower()}")
+    if border_summary:
+        applied_parts.append(border_summary)
+    if dropdown_summary:
+        applied_parts.append(dropdown_summary)
 
     summary = ", ".join(applied_parts)
 
@@ -1047,7 +1168,7 @@ async def _format_sheet_range_impl(
     title="Format Sheet Range",
     annotations=ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=False,
         openWorldHint=True,
     ),
@@ -1069,15 +1190,21 @@ async def format_sheet_range(
     bold: Optional[bool] = None,
     italic: Optional[bool] = None,
     font_size: Optional[int] = None,
+    merge_cells: Optional[bool] = None,
+    merge_type: Optional[str] = None,
+    borders: Optional[str] = None,
     border_style: Optional[str] = None,
     border_color: Optional[str] = None,
-    border_sides: Optional[List[str]] = None,
+    dropdown_values: Optional[StringList] = None,
+    dropdown_strict: Optional[bool] = None,
+    clear_dropdown: Optional[bool] = None,
+    border_sides: Optional[Union[str, List[str]]] = None,
     merge: Optional[str] = None,
     unmerge: bool = False,
 ) -> str:
     """
     Applies formatting to a range: colors, number formats, text wrapping,
-    alignment, text styling, borders, and merging/unmerging cells.
+    alignment, text styling, cell merging/unmerging, borders, and dropdown lists.
 
     Colors accept hex strings (#RRGGBB). Number formats follow Sheets types
     (e.g., NUMBER, CURRENCY, DATE, PERCENT). If no sheet name is provided,
@@ -1101,17 +1228,32 @@ async def format_sheet_range(
         bold (Optional[bool]): Whether to apply bold formatting.
         italic (Optional[bool]): Whether to apply italic formatting.
         font_size (Optional[int]): Font size in points.
-        border_style (Optional[str]): Border line style - SOLID, SOLID_MEDIUM,
-            SOLID_THICK, DASHED, DOTTED, DOUBLE, or NONE (removes borders).
-        border_color (Optional[str]): Hex border color (e.g., "#000000").
-            Requires border_style.
-        border_sides (Optional[List[str]]): Which sides get the border: any of
-            top, bottom, left, right, innerHorizontal, innerVertical, or the
-            groups "all" (default), "outer", "inner". Requires border_style.
-        merge (Optional[str]): Merge the cells in the range - "all" (one cell),
+        merge_cells (Optional[bool]): True merges the range, False unmerges it.
+            Merging keeps only the top-left value of each merged group.
+        merge_type (Optional[str]): MERGE_ALL (default), MERGE_COLUMNS, or
+            MERGE_ROWS. Setting it implies merge_cells=True.
+        borders (Optional[str]): Which borders to draw, comma-separated: all,
+            outer, inner, top, bottom, left, right, inner_horizontal,
+            inner_vertical (e.g., "outer" or "bottom,inner_horizontal").
+            "none" removes every border in the range.
+        border_style (Optional[str]): SOLID (default), SOLID_MEDIUM, SOLID_THICK,
+            DASHED, DOTTED, or DOUBLE. Requires borders.
+        border_color (Optional[str]): Hex border color (default black). Requires
+            borders.
+        dropdown_values (Optional[List[str]]): Turns every cell in the range into
+            a dropdown offering these values (e.g., ["open", "done"]).
+        dropdown_strict (Optional[bool]): With dropdown_values: reject other
+            input (default True) or only show a warning (False).
+        clear_dropdown (Optional[bool]): Remove all data validation from the
+            range: dropdowns, but also checkboxes and other validation rules.
+        border_sides (Optional[List[str]]): List form of borders: any of top,
+            bottom, left, right, innerHorizontal, innerVertical, or the groups
+            "all" (default), "outer", "inner". Cannot be combined with borders.
+        merge (Optional[str]): Shorthand for merge_type - "all" (one cell),
             "columns" (merge each column vertically) or "rows" (merge each row
             horizontally). Values other than the top-left of each merge are lost.
-        unmerge (bool): Unmerge every merged cell in the range. Defaults to False.
+        unmerge (bool): Shorthand for merge_cells=False: unmerge every merged
+            cell in the range. Defaults to False.
 
     Returns:
         str: Confirmation of the applied formatting.
@@ -1137,8 +1279,14 @@ async def format_sheet_range(
         bold=bold,
         italic=italic,
         font_size=font_size,
+        merge_cells=merge_cells,
+        merge_type=merge_type,
+        borders=borders,
         border_style=border_style,
         border_color=border_color,
+        dropdown_values=dropdown_values,
+        dropdown_strict=dropdown_strict,
+        clear_dropdown=clear_dropdown,
         border_sides=border_sides,
         merge=merge,
         unmerge=unmerge,
@@ -1648,8 +1796,9 @@ async def create_sheet(
     sheet_name: Optional[str] = None,
     source_sheet_name: Optional[str] = None,
     insert_sheet_index: Optional[int] = None,
+    destination_spreadsheet_id: Optional[str] = None,
 ) -> str:
-    """Creates a new sheet or duplicates an existing sheet (user_google_email: str, spreadsheet_id: str, sheet_name: Optional[str] = None, source_sheet_name: Optional[str] = None, insert_sheet_index: Optional[int] = None)."""
+    """Creates a new sheet or duplicates an existing sheet, into destination_spreadsheet_id when given (user_google_email: str, spreadsheet_id: str, sheet_name: Optional[str] = None, source_sheet_name: Optional[str] = None, insert_sheet_index: Optional[int] = None, destination_spreadsheet_id: Optional[str] = None)."""
     if insert_sheet_index is not None and (
         isinstance(insert_sheet_index, bool)
         or not isinstance(insert_sheet_index, int)
@@ -1657,14 +1806,27 @@ async def create_sheet(
     ):
         raise UserInputError("insert_sheet_index must be a non-negative integer.")
 
+    if destination_spreadsheet_id is not None:
+        destination_spreadsheet_id = destination_spreadsheet_id.strip()
+        if not destination_spreadsheet_id:
+            raise UserInputError(
+                "destination_spreadsheet_id must be a non-empty string"
+            )
+        if source_sheet_name is None:
+            raise UserInputError(
+                "destination_spreadsheet_id requires source_sheet_name"
+            )
+
     if source_sheet_name is not None:
         source_sheet_name = source_sheet_name.strip()
         if not source_sheet_name:
             raise UserInputError("source_sheet_name must be a non-empty string")
 
+        target_spreadsheet_id = destination_spreadsheet_id or spreadsheet_id
         logger.info(
             f"[create_sheet] Duplicate invoked. Email: '{user_google_email}', "
-            f"Spreadsheet: {spreadsheet_id}, Source: {source_sheet_name}"
+            f"Spreadsheet: {spreadsheet_id}, Source: {source_sheet_name}, "
+            f"Destination: {target_spreadsheet_id}"
         )
 
         spreadsheet = await asyncio.to_thread(
@@ -1677,27 +1839,37 @@ async def create_sheet(
         source_sheet = _select_sheet(sheets, source_sheet_name)
         source_sheet_id = source_sheet["properties"]["sheetId"]
 
-        dup_request = {"sourceSheetId": source_sheet_id}
-        if sheet_name is not None:
-            dup_request["newSheetName"] = sheet_name
-        if insert_sheet_index is not None:
-            dup_request["insertSheetIndex"] = insert_sheet_index
+        if target_spreadsheet_id != spreadsheet_id:
+            new_props = await _copy_sheet_to_spreadsheet(
+                service,
+                spreadsheet_id,
+                source_sheet_id,
+                target_spreadsheet_id,
+                sheet_name,
+                insert_sheet_index,
+            )
+        else:
+            dup_request = {"sourceSheetId": source_sheet_id}
+            if sheet_name is not None:
+                dup_request["newSheetName"] = sheet_name
+            if insert_sheet_index is not None:
+                dup_request["insertSheetIndex"] = insert_sheet_index
 
-        request_body = {"requests": [{"duplicateSheet": dup_request}]}
+            request_body = {"requests": [{"duplicateSheet": dup_request}]}
 
-        response = await asyncio.to_thread(
-            service.spreadsheets()
-            .batchUpdate(spreadsheetId=spreadsheet_id, body=request_body)
-            .execute
-        )
+            response = await asyncio.to_thread(
+                service.spreadsheets()
+                .batchUpdate(spreadsheetId=spreadsheet_id, body=request_body)
+                .execute
+            )
+            new_props = response["replies"][0]["duplicateSheet"]["properties"]
 
-        new_props = response["replies"][0]["duplicateSheet"]["properties"]
         new_id = new_props["sheetId"]
         new_title = new_props["title"]
 
         text_output = (
             f"Successfully duplicated '{source_sheet_name}' to '{new_title}' "
-            f"(ID: {new_id}) in spreadsheet {spreadsheet_id} for {user_google_email}."
+            f"(ID: {new_id}) in spreadsheet {target_spreadsheet_id} for {user_google_email}."
         )
 
         logger.info(
@@ -2005,6 +2177,19 @@ def _build_row_visibility_requests(sheet_id, row_nums, hidden, label):
     return reqs
 
 
+def _count_deleted_before(requests, dimension, index):
+    """Count positions in dimension deleted by requests that precede index."""
+    spans = [
+        req["deleteDimension"]["range"]
+        for req in requests
+        if "deleteDimension" in req
+        and req["deleteDimension"]["range"]["dimension"] == dimension
+    ]
+    return sum(
+        max(0, min(index, span["endIndex"]) - span["startIndex"]) for span in spans
+    )
+
+
 async def _resize_sheet_dimensions_impl(
     service,
     spreadsheet_id: str,
@@ -2032,6 +2217,11 @@ async def _resize_sheet_dimensions_impl(
     Manages sheet-level dimension properties: resize columns/rows, auto-resize
     to fit content, freeze rows/columns, hide/unhide rows/columns, and
     insert/delete rows/columns.
+
+    Every row number and column letter refers to the sheet as it was before
+    the call, even when one call both inserts and deletes. Deletes are applied
+    before inserts, and an insert position inside a deleted span lands where
+    that span was.
 
     Args:
         service: Google Sheets API service client.
@@ -2118,22 +2308,7 @@ async def _resize_sheet_dimensions_impl(
         .execute
     )
     sheets = metadata.get("sheets", [])
-    if not sheets:
-        raise UserInputError("No sheets found in spreadsheet.")
-
-    # Find target sheet
-    target_sheet = None
-    if sheet_name:
-        for sheet in sheets:
-            if sheet.get("properties", {}).get("title") == sheet_name:
-                target_sheet = sheet
-                break
-        if not target_sheet:
-            raise UserInputError(f"Sheet '{sheet_name}' not found.")
-    else:
-        target_sheet = sheets[0]
-
-    sheet_id = target_sheet["properties"]["sheetId"]
+    sheet_id = _select_sheet(sheets, sheet_name)["properties"]["sheetId"]
 
     requests = []
     applied_parts = []
@@ -2332,86 +2507,6 @@ async def _resize_sheet_dimensions_impl(
         )
         applied_parts.append(f"unhid rows: {', '.join(str(r) for r in unhide_rows)}")
 
-    # Build insert row requests
-    if insert_rows is not None:
-        if not isinstance(insert_rows, int) or insert_rows < 1:
-            raise UserInputError("insert_rows must be a positive integer.")
-        if insert_rows_at is not None:
-            if not isinstance(insert_rows_at, int) or insert_rows_at < 1:
-                raise UserInputError(
-                    "insert_rows_at must be a positive integer (1-based)."
-                )
-            start_idx = insert_rows_at - 1
-        else:
-            start_idx = None
-
-        if start_idx is not None:
-            requests.append(
-                {
-                    "insertDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "ROWS",
-                            "startIndex": start_idx,
-                            "endIndex": start_idx + insert_rows,
-                        },
-                        "inheritFromBefore": start_idx > 0,
-                    }
-                }
-            )
-            applied_parts.append(
-                f"inserted {insert_rows} row(s) at row {insert_rows_at}"
-            )
-        else:
-            requests.append(
-                {
-                    "appendDimension": {
-                        "sheetId": sheet_id,
-                        "dimension": "ROWS",
-                        "length": insert_rows,
-                    }
-                }
-            )
-            applied_parts.append(f"appended {insert_rows} row(s)")
-
-    # Build insert column requests
-    if insert_columns is not None:
-        if not isinstance(insert_columns, int) or insert_columns < 1:
-            raise UserInputError("insert_columns must be a positive integer.")
-        if insert_columns_at is not None:
-            col_idx = _column_to_index(str(insert_columns_at).upper())
-            if col_idx is None:
-                raise UserInputError(
-                    f"Invalid column letter for insert_columns_at: '{insert_columns_at}'."
-                )
-            requests.append(
-                {
-                    "insertDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "COLUMNS",
-                            "startIndex": col_idx,
-                            "endIndex": col_idx + insert_columns,
-                        },
-                        "inheritFromBefore": col_idx > 0,
-                    }
-                }
-            )
-            applied_parts.append(
-                f"inserted {insert_columns} column(s) at column {insert_columns_at}"
-            )
-        else:
-            requests.append(
-                {
-                    "appendDimension": {
-                        "sheetId": sheet_id,
-                        "dimension": "COLUMNS",
-                        "length": insert_columns,
-                    }
-                }
-            )
-            applied_parts.append(f"appended {insert_columns} column(s)")
-
     # Reject mixing delete_rows and delete_row_range — their interleaved
     # deleteDimension requests shift indices unpredictably.
     if delete_rows and delete_row_range:
@@ -2419,6 +2514,9 @@ async def _resize_sheet_dimensions_impl(
             "delete_rows and delete_row_range cannot be used together. "
             "Specify one or the other."
         )
+
+    # Deletes run before inserts so every caller index refers to the original
+    # layout; insert positions are shifted past the deletions preceding them.
 
     # Build delete row requests (process in reverse to keep indices stable)
     if delete_rows:
@@ -2432,8 +2530,7 @@ async def _resize_sheet_dimensions_impl(
                 raise UserInputError(
                     f"Row number must be an integer >= 1 in delete_rows, got {row_num}."
                 ) from exc
-        sorted_rows = sorted(parsed_delete_rows, reverse=True)
-        for row_num in sorted_rows:
+        for row_num in sorted(set(parsed_delete_rows), reverse=True):
             if row_num < 1:
                 raise UserInputError(
                     f"Row number must be >= 1 in delete_rows, got {row_num}."
@@ -2495,17 +2592,15 @@ async def _resize_sheet_dimensions_impl(
     if delete_columns:
         if not isinstance(delete_columns, list):
             raise UserInputError("delete_columns must be a list of column letters.")
-        col_indices = []
+        col_indices = set()
         for col_letter in delete_columns:
             col_idx = _column_to_index(str(col_letter).upper())
             if col_idx is None:
                 raise UserInputError(
                     f"Invalid column letter in delete_columns: '{col_letter}'."
                 )
-            col_indices.append((col_letter, col_idx))
-        # Sort by index descending to keep indices stable during deletion
-        col_indices.sort(key=lambda x: x[1], reverse=True)
-        for _, col_idx in col_indices:
+            col_indices.add(col_idx)
+        for col_idx in sorted(col_indices, reverse=True):
             requests.append(
                 {
                     "deleteDimension": {
@@ -2521,6 +2616,88 @@ async def _resize_sheet_dimensions_impl(
         applied_parts.append(
             f"deleted columns: {', '.join(str(c) for c in delete_columns)}"
         )
+
+    # Build insert row requests
+    if insert_rows is not None:
+        if not isinstance(insert_rows, int) or insert_rows < 1:
+            raise UserInputError("insert_rows must be a positive integer.")
+        if insert_rows_at is not None:
+            if not isinstance(insert_rows_at, int) or insert_rows_at < 1:
+                raise UserInputError(
+                    "insert_rows_at must be a positive integer (1-based)."
+                )
+            start_idx = insert_rows_at - 1
+            start_idx -= _count_deleted_before(requests, "ROWS", start_idx)
+        else:
+            start_idx = None
+
+        if start_idx is not None:
+            requests.append(
+                {
+                    "insertDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": start_idx,
+                            "endIndex": start_idx + insert_rows,
+                        },
+                        "inheritFromBefore": start_idx > 0,
+                    }
+                }
+            )
+            applied_parts.append(
+                f"inserted {insert_rows} row(s) at row {insert_rows_at}"
+            )
+        else:
+            requests.append(
+                {
+                    "appendDimension": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "length": insert_rows,
+                    }
+                }
+            )
+            applied_parts.append(f"appended {insert_rows} row(s)")
+
+    # Build insert column requests
+    if insert_columns is not None:
+        if not isinstance(insert_columns, int) or insert_columns < 1:
+            raise UserInputError("insert_columns must be a positive integer.")
+        if insert_columns_at is not None:
+            col_idx = _column_to_index(str(insert_columns_at).upper())
+            if col_idx is None:
+                raise UserInputError(
+                    f"Invalid column letter for insert_columns_at: '{insert_columns_at}'."
+                )
+            col_idx -= _count_deleted_before(requests, "COLUMNS", col_idx)
+            requests.append(
+                {
+                    "insertDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": col_idx,
+                            "endIndex": col_idx + insert_columns,
+                        },
+                        "inheritFromBefore": col_idx > 0,
+                    }
+                }
+            )
+            applied_parts.append(
+                f"inserted {insert_columns} column(s) at column {insert_columns_at}"
+            )
+        else:
+            requests.append(
+                {
+                    "appendDimension": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "length": insert_columns,
+                    }
+                }
+            )
+            applied_parts.append(f"appended {insert_columns} column(s)")
 
     # Execute batch update
     await asyncio.to_thread(
@@ -2554,11 +2731,13 @@ async def manage_sheet_tab(
     action: str,
     new_name: Optional[str] = None,
     new_index: Optional[int] = None,
+    tab_color: Optional[str] = None,
+    show_gridlines: Optional[bool] = None,
     destination_spreadsheet_id: Optional[str] = None,
 ) -> str:
     """
-    Manages the lifecycle of an existing sheet tab: rename, delete, hide, unhide,
-    reorder, or copy it into another spreadsheet.
+    Manages an existing sheet tab: rename, delete, hide, unhide, reorder,
+    style (tab color and gridlines), or copy it into another spreadsheet.
 
     Use create_sheet to add a tab, and resize_sheet_dimensions for row and column
     level changes. This tool operates on the tab itself.
@@ -2567,9 +2746,14 @@ async def manage_sheet_tab(
         user_google_email: User's Google email address
         spreadsheet_id: ID of the spreadsheet
         sheet_name: Title of the existing tab to act on
-        action: One of "rename", "delete", "hide", "unhide", "reorder", "copy_to"
+        action: One of "rename", "delete", "hide", "unhide", "reorder", "style",
+            "copy_to"
         new_name: New title, required for action="rename"
         new_index: New zero-based position, required for action="reorder"
+        tab_color: For action="style": hex tab color (#RRGGBB), or "none" to
+            remove it
+        show_gridlines: For action="style": show (True) or hide (False) the
+            sheet's gridlines
         destination_spreadsheet_id: Spreadsheet to copy the tab into, required for
             action="copy_to". Pass the same spreadsheet_id to duplicate within the
             file. The copy is appended as the last tab, titled "Copy of <name>".
@@ -2577,7 +2761,15 @@ async def manage_sheet_tab(
     Returns:
         str: Confirmation of the change.
     """
-    valid_actions = ("rename", "delete", "hide", "unhide", "reorder", "copy_to")
+    valid_actions = (
+        "rename",
+        "delete",
+        "hide",
+        "unhide",
+        "reorder",
+        "style",
+        "copy_to",
+    )
     action_lower = action.strip().lower() if isinstance(action, str) else ""
     if action_lower not in valid_actions:
         raise UserInputError(
@@ -2604,6 +2796,14 @@ async def manage_sheet_tab(
                 "destination_spreadsheet_id is required for action='copy_to'."
             )
         destination_spreadsheet_id = destination_spreadsheet_id.strip()
+    if action_lower == "style":
+        style_properties, style_fields, style_summary = _build_tab_style_properties(
+            tab_color, show_gridlines
+        )
+    elif tab_color is not None or show_gridlines is not None:
+        raise UserInputError(
+            "tab_color and show_gridlines only apply to action='style'."
+        )
 
     logger.info(
         f"[manage_sheet_tab] Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, "
@@ -2656,6 +2856,15 @@ async def manage_sheet_tab(
             properties["hidden"] = action_lower == "hide"
             fields = "hidden"
             summary = f"{action_lower} sheet '{sheet_name}'"
+        elif action_lower == "style":
+            sheet_type = target_sheet["properties"].get("sheetType", "GRID")
+            if show_gridlines is not None and sheet_type != "GRID":
+                raise UserInputError(
+                    f"'{sheet_name}' is a {sheet_type} sheet and has no gridlines."
+                )
+            properties.update(style_properties)
+            fields = style_fields
+            summary = f"styled sheet '{sheet_name}' ({style_summary})"
         else:
             if new_index >= len(sheets):
                 raise UserInputError(
@@ -2726,6 +2935,11 @@ async def resize_sheet_dimensions(
     Manages sheet-level dimension properties: resize columns/rows, auto-resize
     to fit content, freeze rows/columns, hide/unhide rows/columns, and
     insert/delete rows/columns.
+
+    Every row number and column letter refers to the sheet as it was before
+    the call, even when one call both inserts and deletes. Deletes are applied
+    before inserts, and an insert position inside a deleted span lands where
+    that span was.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
